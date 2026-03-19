@@ -69,14 +69,15 @@ def tdt_greedy_decode(
         h_states, c_states = prediction_net.init_states()
         prev_token = blank_id
 
+        # Get initial predictor output for the blank/SOS token.
+        pred_out, h_states, c_states = prediction_net(
+            prev_token, h_states, c_states
+        )
+
         while t < T:
-            symbols_emitted = 0
+            symbols_at_t = 0
 
-            while symbols_emitted < max_symbols_per_step:
-                pred_out, h_states, c_states = prediction_net(
-                    prev_token, h_states, c_states
-                )
-
+            while symbols_at_t < max_symbols_per_step:
                 logits = joint_net(encoder_output[b, t], pred_out)
 
                 token_logits = logits[:num_token_classes]
@@ -86,18 +87,25 @@ def tdt_greedy_decode(
                 dur_idx = int(np.argmax(dur_logits))
                 duration = durations[dur_idx]
 
-                if token != blank_id:
-                    tokens.append(token)
-                    prev_token = token
-                    symbols_emitted += 1
-
-                if token == blank_id or duration > 0:
+                if token == blank_id:
+                    # Blank: advance time, do NOT update prediction network.
                     t += max(duration, 1)
                     break
-                # duration == 0 and non-blank: continue emitting at same t
 
+                # Non-blank: emit token, update prediction network.
+                tokens.append(token)
+                prev_token = token
+                pred_out, h_states, c_states = prediction_net(
+                    prev_token, h_states, c_states
+                )
+                symbols_at_t += 1
+
+                if duration > 0:
+                    t += duration
+                    break
+                # duration == 0: stay at same t (multiple emissions)
             else:
-                # Safety: hit max_symbols_per_step, force advance
+                # Safety: hit max_symbols_per_step, force advance.
                 t += 1
 
         results.append(tokens)

@@ -24,7 +24,7 @@ from .tokenizer import ParakeetTDTTokenizer
 
 parakeet_tdt_arch = SupportedArchitecture(
     name="ParakeetForTDT",
-    task=PipelineTask.AUDIO_TRANSCRIPTION,
+    task=PipelineTask.EMBEDDINGS_GENERATION,
     example_repo_ids=[
         "nvidia/parakeet-tdt-0.6b-v3",
     ],
