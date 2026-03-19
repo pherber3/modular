@@ -93,6 +93,10 @@ class ParakeetModelConfig(ArchConfig):
     def attention_bias(self) -> bool:
         return getattr(self.encoder_config, "attention_bias", True)
 
+    @property
+    def convolution_bias(self) -> bool:
+        return getattr(self.encoder_config, "convolution_bias", True)
+
     @override
     def get_max_seq_len(self) -> int:
         return getattr(

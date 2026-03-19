@@ -103,6 +103,10 @@ class TDTModelConfig(ArchConfig):
     def attention_bias(self) -> bool:
         return getattr(self.encoder_config, "attention_bias", False)
 
+    @property
+    def convolution_bias(self) -> bool:
+        return getattr(self.encoder_config, "convolution_bias", False)
+
     # --- TDT-specific properties ---
 
     @property

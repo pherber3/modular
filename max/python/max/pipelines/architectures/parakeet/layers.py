@@ -130,6 +130,8 @@ class ParakeetConvModule(Module):
         kernel_size = config.conv_kernel_size
         padding = (kernel_size - 1) // 2
 
+        conv_bias = config.convolution_bias
+
         self.pointwise_conv1 = Conv1D(
             kernel_size=1,
             in_channels=channels,
@@ -138,7 +140,7 @@ class ParakeetConvModule(Module):
             stride=1,
             padding=0,
             device=config.device,
-            has_bias=True,
+            has_bias=conv_bias,
             permute=True,
         )
         self.depthwise_conv = Conv1D(
@@ -150,7 +152,7 @@ class ParakeetConvModule(Module):
             padding=padding,
             num_groups=channels,
             device=config.device,
-            has_bias=True,
+            has_bias=conv_bias,
             permute=True,
         )
         self.norm = BatchNorm1d(
@@ -164,7 +166,7 @@ class ParakeetConvModule(Module):
             stride=1,
             padding=0,
             device=config.device,
-            has_bias=True,
+            has_bias=conv_bias,
             permute=True,
         )
 
