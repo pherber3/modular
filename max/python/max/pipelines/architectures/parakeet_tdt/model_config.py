@@ -141,11 +141,19 @@ class TDTModelConfig(ArchConfig):
     def blank_id(self) -> int:
         return self.vocab_size  # blank token = vocab_size
 
+    @property
+    def normalize_features(self) -> str | None:
+        """Feature normalization mode from NeMo preprocessor config.
+
+        Returns ``"per_feature"`` if each mel bin should be normalized to
+        zero mean / unit variance per utterance, or ``None`` for no
+        normalization.
+        """
+        return getattr(self.huggingface_config, "normalize_features", None)
+
     @override
     def get_max_seq_len(self) -> int:
-        return getattr(
-            self.encoder_config, "max_position_embeddings", 5000
-        )
+        return getattr(self.encoder_config, "max_position_embeddings", 5000)
 
     @override
     @classmethod

@@ -99,9 +99,7 @@ class ParakeetModelConfig(ArchConfig):
 
     @override
     def get_max_seq_len(self) -> int:
-        return getattr(
-            self.encoder_config, "max_position_embeddings", 5000
-        )
+        return getattr(self.encoder_config, "max_position_embeddings", 5000)
 
     @override
     @classmethod

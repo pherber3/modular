@@ -34,8 +34,7 @@ def _is_subsampling_conv_weight(key: str) -> bool:
     check in case someone loads unconverted weights.
     """
     return key.endswith(".weight") and (
-        "subsampling.initial_conv." in key
-        or "subsampling.dw_pw_stages." in key
+        "subsampling.initial_conv." in key or "subsampling.dw_pw_stages." in key
     )
 
 

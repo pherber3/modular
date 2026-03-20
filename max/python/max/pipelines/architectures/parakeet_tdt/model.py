@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 from max.driver import Buffer, Device, DLPackArray
 from max.dtype import DType
 from max.engine import InferenceSession, Model
@@ -48,7 +49,28 @@ from .decode import tdt_greedy_decode
 from .decoder import JointNetwork, PredictionNetwork
 from .model_config import TDTModelConfig
 
+NDFloat = npt.NDArray[np.floating]
+
 logger = logging.getLogger("max.pipelines")
+
+
+def normalize_mel_features(features: NDFloat, mode: str | None) -> NDFloat:
+    """Apply feature normalization matching NeMo's preprocessor.
+
+    Args:
+        features: Mel spectrogram of shape ``(batch, num_frames, num_mel_bins)``.
+        mode: Normalization mode from config. ``"per_feature"`` normalizes
+            each mel bin to zero mean / unit variance per utterance.
+            ``None`` or other values are no-ops.
+
+    Returns:
+        Normalized features, same shape as input.
+    """
+    if mode == "per_feature":
+        mean = features.mean(axis=1, keepdims=True)
+        std = features.std(axis=1, keepdims=True)
+        features = (features - mean) / (std + 1e-5)
+    return features
 
 
 @dataclass
@@ -171,6 +193,26 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
             blank_id=self.tdt_config.blank_id,
         )
 
+    def prepare_mel_input(self, features: NDFloat) -> ParakeetTDTInputs:
+        """Prepare mel features for model execution.
+
+        Applies feature normalization (if configured) and wraps in a Buffer.
+        This is the entry point for audio that has already been converted to
+        mel spectrogram features.
+
+        Args:
+            features: Mel spectrogram, shape ``(batch, num_frames, num_mel_bins)``.
+
+        Returns:
+            Model inputs ready for :meth:`execute` or :meth:`decode`.
+        """
+        features = normalize_mel_features(
+            features, self.tdt_config.normalize_features
+        )
+        return ParakeetTDTInputs(
+            input_features=Buffer.from_numpy(features.astype(np.float32))
+        )
+
     def prepare_initial_token_inputs(
         self,
         replica_batches: Sequence[Sequence[TextContext]],
@@ -182,8 +224,7 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
 
         raise NotImplementedError(
             "Audio preprocessing (mel spectrogram extraction) is not yet "
-            "wired in. prepare_initial_token_inputs cannot produce real "
-            "model inputs."
+            "wired in. Use prepare_mel_input() with pre-extracted features."
         )
 
     def prepare_next_token_inputs(
