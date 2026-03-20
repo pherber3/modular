@@ -427,6 +427,29 @@ PIPELINE_SPECS = [
 ]
 
 modular_py_binary(
+    name = "benchmark_parakeet",
+    testonly = True,
+    srcs = ["benchmark_parakeet.py"],
+    imports = ["."],
+    main = "benchmark_parakeet.py",
+    tags = [
+        "no-pydeps",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/interfaces",
+        "//max/python/max/pipelines/architectures",
+        "//max/python/max/pipelines/lib",
+        requirement("huggingface-hub"),
+        requirement("numpy"),
+        requirement("transformers"),
+    ],
+)
+
+modular_py_binary(
     name = "compare_tensors",
     testonly = True,
     srcs = ["compare_tensors.py"],
