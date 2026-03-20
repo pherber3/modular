@@ -134,7 +134,7 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
         features = normalize_per_feature(features)
 
         model_inputs = ParakeetInputs(
-            input_features=Buffer.from_numpy(features)
+            input_features=Buffer.from_numpy(features).to(self.devices[0])
         )
         texts = self.decode(model_inputs, tokenizer)
         return texts[0]

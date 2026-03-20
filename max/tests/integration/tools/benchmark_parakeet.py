@@ -544,7 +544,7 @@ def bench_full_pipeline(
                 r_norm.times_ms.append((t1 - t0) * 1000)
 
             t0 = time.perf_counter()
-            buf = Buffer.from_numpy(features)
+            buf = Buffer.from_numpy(features).to(devices[0])
             t1 = time.perf_counter()
             if record:
                 r_buffer.times_ms.append((t1 - t0) * 1000)

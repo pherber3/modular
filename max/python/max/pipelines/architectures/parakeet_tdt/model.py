@@ -185,7 +185,9 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         if self.tdt_config.normalize_features == "per_feature":
             features = normalize_per_feature(features)
         return ParakeetTDTInputs(
-            input_features=Buffer.from_numpy(features.astype(np.float32))
+            input_features=Buffer.from_numpy(features.astype(np.float32)).to(
+                self.devices[0]
+            )
         )
 
     def transcribe(self, audio_bytes: bytes, tokenizer: object) -> str:
