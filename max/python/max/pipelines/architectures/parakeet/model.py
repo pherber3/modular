@@ -76,6 +76,7 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
             adapter,
             return_logits,
         )
+        self.config = ParakeetModelConfig.initialize(self.pipeline_config)
         self.model = self.load_model(session)
 
     @classmethod
@@ -124,10 +125,9 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
                 "Please resample before sending."
             )
 
-        config = ParakeetModelConfig.initialize(self.pipeline_config)
         features = extract_mel(
             audio_data,
-            n_mels=config.num_mel_bins,
+            n_mels=self.config.num_mel_bins,
             preemphasis=0.97,
             periodic_window=False,
         )
@@ -172,8 +172,7 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
                 key: value.data() for key, value in self.weights.items()
             }
 
-        config = ParakeetModelConfig.initialize(self.pipeline_config)
-        graph = build_graph(config, state_dict)
+        graph = build_graph(self.config, state_dict)
         timer.mark_build_complete()
 
         model = session.load(graph, weights_registry=state_dict)

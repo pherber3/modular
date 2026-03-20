@@ -243,7 +243,9 @@ def bench_ctc_decode(n_warmup: int, n_runs: int) -> TimingResult:
     from max.pipelines.architectures.parakeet.decode import ctc_greedy_decode
 
     class MockTokenizer:
-        def decode(self, ids, skip_special_tokens=True):
+        def decode(
+            self, ids: list[int], skip_special_tokens: bool = True
+        ) -> str:
             return " ".join(str(x) for x in ids)
 
     tokenizer = MockTokenizer()
@@ -387,12 +389,19 @@ def bench_full_pipeline(
         normalize_per_feature,
         read_wav,
     )
-    from max.pipelines.lib import ModelInputs
+    from max.pipelines.architectures.parakeet.decode import ctc_greedy_decode
+    from max.pipelines.architectures.parakeet_tdt.decode import (
+        tdt_greedy_decode,
+    )
 
+    r_wav = TimingResult(f"read_wav ({model_type})")
+    r_mel = TimingResult(f"extract_mel ({model_type})")
+    r_norm = TimingResult(f"normalize ({model_type})")
     r_buffer = TimingResult(f"buffer_from_numpy ({model_type})")
     r_encoder = TimingResult(f"encoder_execute ({model_type})")
     r_transfer = TimingResult(f"output_transfer ({model_type})")
-    r_e2e = TimingResult(f"end_to_end_transcribe ({model_type})")
+    r_decode = TimingResult(f"decode ({model_type})")
+    r_e2e = TimingResult(f"end_to_end ({model_type})")
 
     if model_type == "ctc":
         model_id = "nvidia/parakeet-ctc-1.1b"
@@ -425,7 +434,9 @@ def bench_full_pipeline(
         from max.pipelines.lib.hf_utils import download_weight_files
 
         # Build pipeline config
-        device_spec = DeviceSpec.cpu() if device == "cpu" else DeviceSpec.accelerator()
+        device_spec = (
+            DeviceSpec.cpu() if device == "cpu" else DeviceSpec.accelerator()
+        )
         model_config = MAXModelConfig(
             device_specs=[device_spec],
             quantization_encoding=encoding,  # type: ignore[arg-type]
@@ -464,7 +475,9 @@ def bench_full_pipeline(
                 devices=devices,
                 kv_cache_config=config.model.kv_cache,
                 weights=weights,
-                adapter=ctc_adapter if wfmt == WeightsFormat.safetensors else None,
+                adapter=(
+                    ctc_adapter if wfmt == WeightsFormat.safetensors else None
+                ),
             )
         else:
             from max.pipelines.architectures.parakeet_tdt.model import (
@@ -481,7 +494,9 @@ def bench_full_pipeline(
                 devices=devices,
                 kv_cache_config=config.model.kv_cache,
                 weights=weights,
-                adapter=tdt_adapter if wfmt == WeightsFormat.safetensors else None,
+                adapter=(
+                    tdt_adapter if wfmt == WeightsFormat.safetensors else None
+                ),
             )
 
         # Load tokenizer
@@ -493,65 +508,94 @@ def bench_full_pipeline(
             f"  Model loaded. Running {n_warmup} warmup + {n_runs} timed iterations..."
         )
 
-        # Pre-extract mel features for stage-level timing
-        prepped = []
-        for ab in audio_bytes_list[:20]:
+        if model_type == "ctc":
+            n_mels = ctc_model.config.num_mel_bins
+        else:
+            n_mels = tdt_model.tdt_config.num_mel_bins
+
+        for i in range(n_warmup + n_runs):
+            ab = audio_bytes_list[i % len(audio_bytes_list)]
+            record = i >= n_warmup
+
+            # -- Single pipeline pass, timing each stage --
+            e2e_start = time.perf_counter()
+
+            t0 = time.perf_counter()
             audio, _ = read_wav(ab)
+            t1 = time.perf_counter()
+            if record:
+                r_wav.times_ms.append((t1 - t0) * 1000)
+
+            t0 = time.perf_counter()
             features = extract_mel(
                 audio,
-                n_mels=80,
+                n_mels=n_mels,
                 preemphasis=preemphasis,
                 periodic_window=periodic,
             )
+            t1 = time.perf_counter()
+            if record:
+                r_mel.times_ms.append((t1 - t0) * 1000)
+
+            t0 = time.perf_counter()
             features = normalize_per_feature(features).astype(np.float32)
-            prepped.append(features)
+            t1 = time.perf_counter()
+            if record:
+                r_norm.times_ms.append((t1 - t0) * 1000)
 
-        for i in range(n_warmup + n_runs):
-            idx = i % len(prepped)
-            features = prepped[idx]
-            ab = audio_bytes_list[idx % len(audio_bytes_list)]
-            record = i >= n_warmup
-
-            # Buffer creation
             t0 = time.perf_counter()
             buf = Buffer.from_numpy(features)
             t1 = time.perf_counter()
             if record:
                 r_buffer.times_ms.append((t1 - t0) * 1000)
 
-            # Encoder execution
-            if model_type == "ctc":
-                model_inputs: ModelInputs = ParakeetInputs(input_features=buf)
-            else:
-                model_inputs = ParakeetTDTInputs(input_features=buf)
-
             t0 = time.perf_counter()
             if model_type == "ctc":
-                outputs = ctc_model.execute(model_inputs)
+                outputs = ctc_model.execute(ParakeetInputs(input_features=buf))
             else:
-                outputs = tdt_model.execute(model_inputs)
+                outputs = tdt_model.execute(
+                    ParakeetTDTInputs(input_features=buf)
+                )
             t1 = time.perf_counter()
             if record:
                 r_encoder.times_ms.append((t1 - t0) * 1000)
 
-            # Output transfer
             t0 = time.perf_counter()
-            np.from_dlpack(outputs.logits).copy()
+            logits = np.from_dlpack(outputs.logits).copy()
             t1 = time.perf_counter()
             if record:
                 r_transfer.times_ms.append((t1 - t0) * 1000)
 
-            # End-to-end transcribe
             t0 = time.perf_counter()
             if model_type == "ctc":
-                ctc_model.transcribe(ab, tokenizer)
+                ctc_greedy_decode(logits, tokenizer, blank_id=1024)
             else:
-                tdt_model.transcribe(ab, tokenizer)
+                tdt_greedy_decode(
+                    encoder_output=logits,
+                    prediction_net=tdt_model.prediction_net,
+                    joint_net=tdt_model.joint_net,
+                    durations=tdt_model.tdt_config.tdt_durations,
+                    vocab_size=tdt_model.tdt_config.vocab_size,
+                    blank_id=tdt_model.tdt_config.blank_id,
+                )
             t1 = time.perf_counter()
             if record:
-                r_e2e.times_ms.append((t1 - t0) * 1000)
+                r_decode.times_ms.append((t1 - t0) * 1000)
 
-        return [r_buffer, r_encoder, r_transfer, r_e2e]
+            e2e_end = time.perf_counter()
+            if record:
+                r_e2e.times_ms.append((e2e_end - e2e_start) * 1000)
+
+        return [
+            r_wav,
+            r_mel,
+            r_norm,
+            r_buffer,
+            r_encoder,
+            r_transfer,
+            r_decode,
+            r_e2e,
+        ]
 
     except Exception as e:
         print(f"  Failed to load model: {e}")
@@ -578,7 +622,9 @@ def main() -> None:
         default="both",
     )
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--encoding", default="float32", choices=["float32", "bfloat16"])
+    parser.add_argument(
+        "--encoding", default="float32", choices=["float32", "bfloat16"]
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--runs", type=int, default=100)
     parser.add_argument("--n-samples", type=int, default=None)
@@ -604,7 +650,11 @@ def main() -> None:
     print(f"Stages:   {args.stages}")
     print()
 
-    n_samples = args.n_samples if args.n_samples is not None else args.warmup + args.runs
+    n_samples = (
+        args.n_samples
+        if args.n_samples is not None
+        else args.warmup + args.runs
+    )
     audio_files = ensure_audio(n_samples)
     audio_bytes_list = [f.read_bytes() for f in audio_files]
 
