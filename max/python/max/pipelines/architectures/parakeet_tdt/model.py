@@ -114,12 +114,11 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
             adapter,
             return_logits,
         )
+        self.tdt_config = TDTModelConfig.initialize(self.pipeline_config)
         self.model = self.load_model(session)
+        self._load_decoder_weights()
 
-        config = TDTModelConfig.initialize(self.pipeline_config)
-        self._load_decoder_weights(config)
-
-    def _load_decoder_weights(self, config: TDTModelConfig) -> None:
+    def _load_decoder_weights(self) -> None:
         """Load LSTM prediction network and joint network from npz file."""
         npz_path = huggingface_hub.hf_hub_download(
             self.pipeline_config.model.model_path, "decoder_joint.npz"
@@ -127,7 +126,6 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         weights = dict(np.load(npz_path))
         self.prediction_net = PredictionNetwork.from_npz(weights)
         self.joint_net = JointNetwork.from_npz(weights)
-        self.tdt_config = config
         logger.info(
             "Loaded TDT decoder: %d LSTM layers, pred_hidden=%d",
             self.prediction_net.num_layers,
@@ -236,8 +234,7 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
                 key: value.data() for key, value in self.weights.items()
             }
 
-        config = TDTModelConfig.initialize(self.pipeline_config)
-        graph = build_graph(config, state_dict)
+        graph = build_graph(self.tdt_config, state_dict)
         timer.mark_build_complete()
 
         model = session.load(graph, weights_registry=state_dict)

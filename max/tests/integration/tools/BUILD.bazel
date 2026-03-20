@@ -445,6 +445,7 @@ modular_py_binary(
         "//max/python/max/pipelines/lib",
         requirement("huggingface-hub"),
         requirement("numpy"),
+        requirement("sentencepiece"),
         requirement("transformers"),
     ],
 )
