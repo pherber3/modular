@@ -18,6 +18,8 @@ from typing import Any, cast
 
 from max.interfaces import (
     AudioGenerationOutput,
+    AudioTranscriptionContext,
+    AudioTranscriptionOutput,
     BaseContext,
     BaseContextType,
     EmbeddingsContext,
@@ -39,6 +41,7 @@ from max.interfaces.generation import GenerationOutput
 from max.kv_cache import PagedKVCacheManager
 from max.pipelines.core import TextContext, TTSContext
 from max.pipelines.lib import (
+    AudioTranscriptionPipelineType,
     EmbeddingsPipelineType,
     PipelineConfig,
     TextGenerationPipeline,
@@ -55,6 +58,10 @@ from max.serve.worker_interface import WorkerQueues
 from .audio_generation_scheduler import (
     AudioGenerationScheduler,
     AudioGenerationSchedulerConfig,
+)
+from .audio_transcription_scheduler import (
+    AudioTranscriptionScheduler,
+    AudioTranscriptionSchedulerConfig,
 )
 from .base import CancelRequest, PrefillRequest, PrefillResponse
 from .config import TokenGenerationSchedulerConfig
@@ -113,15 +120,19 @@ def load_scheduler(
                 response_queue,
             ),
             cancel_queue=cancel_queue,
-            max_batch_size=pipeline_config.runtime.max_batch_size
-            if pipeline_config.runtime.max_batch_size is not None
-            else 1,
+            max_batch_size=(
+                pipeline_config.runtime.max_batch_size
+                if pipeline_config.runtime.max_batch_size is not None
+                else 1
+            ),
         )
     elif pipeline.__class__.__name__ == "EmbeddingsPipeline":
         embeddings_scheduler_config = EmbeddingsSchedulerConfig(
-            max_batch_size=pipeline_config.runtime.max_batch_size
-            if pipeline_config.runtime.max_batch_size is not None
-            else 1
+            max_batch_size=(
+                pipeline_config.runtime.max_batch_size
+                if pipeline_config.runtime.max_batch_size is not None
+                else 1
+            )
         )
         emb_pipeline = cast(EmbeddingsPipelineType, pipeline)
         return EmbeddingsScheduler(
@@ -139,6 +150,30 @@ def load_scheduler(
             ),
             cancel_queue=cancel_queue,
         )
+    elif pipeline.__class__.__name__ == "AudioTranscriptionPipeline":
+        transcription_scheduler_config = AudioTranscriptionSchedulerConfig(
+            max_batch_size=(
+                pipeline_config.runtime.max_batch_size
+                if pipeline_config.runtime.max_batch_size is not None
+                else 1
+            )
+        )
+        transcription_pipeline = cast(AudioTranscriptionPipelineType, pipeline)
+        return AudioTranscriptionScheduler(
+            scheduler_config=transcription_scheduler_config,
+            pipeline=transcription_pipeline,
+            request_queue=cast(
+                MAXPullQueue[AudioTranscriptionContext],
+                request_queue,
+            ),
+            response_queue=cast(
+                MAXPushQueue[
+                    dict[RequestID, SchedulerResult[AudioTranscriptionOutput]]
+                ],
+                response_queue,
+            ),
+            cancel_queue=cancel_queue,
+        )
     elif pipeline.__class__.__name__ == "AudioGeneratorPipeline":
         assert hasattr(pipeline, "kv_manager")
         kv_cache = pipeline.kv_manager
@@ -151,9 +186,11 @@ def load_scheduler(
 
         token_gen_config = AudioGenerationSchedulerConfig(
             max_batch_size=pipeline_config.runtime.max_batch_size,
-            max_forward_steps_tg=pipeline_config.runtime.max_num_steps
-            if pipeline_config.runtime.max_num_steps != -1
-            else 1,
+            max_forward_steps_tg=(
+                pipeline_config.runtime.max_num_steps
+                if pipeline_config.runtime.max_num_steps != -1
+                else 1
+            ),
             max_seq_len=pipeline_config.model.max_length,
             target_tokens_per_batch_ce=pipeline_config.runtime.max_batch_input_tokens,
             enable_chunked_prefill=pipeline_config.runtime.enable_chunked_prefill,

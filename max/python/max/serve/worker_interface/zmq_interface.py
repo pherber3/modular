@@ -22,6 +22,7 @@ from typing import Generic
 
 import zmq
 from max.interfaces import (
+    AudioTranscriptionContext,
     BaseContextType,
     EmbeddingsContext,
     PipelineOutputType,
@@ -223,7 +224,11 @@ class ZmqModelWorkerInterface(
     def __init__(
         self,
         pipeline_task: PipelineTask,
-        context_type: type[TextGenerationContext] | type[EmbeddingsContext],
+        context_type: (
+            type[TextGenerationContext]
+            | type[EmbeddingsContext]
+            | type[AudioTranscriptionContext]
+        ),
     ) -> None:
         response_type = pipeline_task.output_type
 

@@ -847,3 +847,23 @@ def reserve_token_space_for_batch(
             proc_end, cur_len = saved_state[ctx.request_id]
             ctx.tokens._processing_range.end = proc_end
             ctx.tokens._current_length = cur_len
+
+
+@dataclass(kw_only=True)
+class ASRContext:
+    """Context for audio transcription (ASR) pipelines.
+
+    Carries raw audio bytes from the API route to the worker process.
+    Implements the ``AudioTranscriptionContext`` protocol.
+    """
+
+    request_id: RequestID
+    audio_data: bytes
+    model_name: str
+    language: str | None = None
+    status: GenerationStatus = GenerationStatus.ACTIVE
+
+    @property
+    def is_done(self) -> bool:
+        """Whether this transcription request has completed."""
+        return self.status.is_done

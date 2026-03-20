@@ -58,6 +58,8 @@ class PipelineTask(str, Enum):
     """Task for generating speech tokens."""
     PIXEL_GENERATION = "pixel_generation"
     """Task for generating pixels."""
+    AUDIO_TRANSCRIPTION = "audio_transcription"
+    """Task for transcribing audio to text."""
 
     @property
     def output_type(
@@ -71,6 +73,7 @@ class PipelineTask(str, Enum):
         from .generation import GenerationOutput
         from .pipeline_variants import (
             AudioGenerationOutput,
+            AudioTranscriptionOutput,
             EmbeddingsGenerationOutput,
             TextGenerationOutput,
         )
@@ -85,6 +88,8 @@ class PipelineTask(str, Enum):
             return dict[RequestID, SchedulerResult[EmbeddingsGenerationOutput]]
         elif self == PipelineTask.AUDIO_GENERATION:
             return dict[RequestID, SchedulerResult[AudioGenerationOutput]]
+        elif self == PipelineTask.AUDIO_TRANSCRIPTION:
+            return dict[RequestID, SchedulerResult[AudioTranscriptionOutput]]
         elif self == PipelineTask.PIXEL_GENERATION:
             return dict[RequestID, SchedulerResult[GenerationOutput]]
         else:

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from .config import PipelineConfig
 
 from .audio_generator_pipeline import AudioGeneratorPipeline
+from .audio_transcription_pipeline import AudioTranscriptionPipeline
 from .config.config_enums import RopeType, SupportedEncoding
 from .embeddings_pipeline import EmbeddingsPipeline
 from .hf_utils import HuggingFaceRepo, is_diffusion_pipeline
@@ -89,6 +90,7 @@ def _infer_task_from_hf_pipeline_tag(
         "feature-extraction": PipelineTask.EMBEDDINGS_GENERATION,
         "sentence-similarity": PipelineTask.EMBEDDINGS_GENERATION,
         "audio-generation": PipelineTask.AUDIO_GENERATION,
+        "automatic-speech-recognition": PipelineTask.AUDIO_TRANSCRIPTION,
         "text-to-image": PipelineTask.PIXEL_GENERATION,
         "image-to-image": PipelineTask.PIXEL_GENERATION,
         # Add more mappings as needed
@@ -102,6 +104,7 @@ def get_pipeline_for_task(
 ) -> (
     type[TextGenerationPipeline[TextContext]]
     | type[EmbeddingsPipeline]
+    | type[AudioTranscriptionPipeline]
     | type[AudioGeneratorPipeline]
     | type[PixelGenerationPipeline[Any]]
     | type[StandaloneSpeculativeDecodingPipeline]
@@ -164,6 +167,8 @@ def get_pipeline_for_task(
         return TextGenerationPipeline[TextContext]
     elif task == PipelineTask.EMBEDDINGS_GENERATION:
         return EmbeddingsPipeline
+    elif task == PipelineTask.AUDIO_TRANSCRIPTION:
+        return AudioTranscriptionPipeline
     elif task == PipelineTask.AUDIO_GENERATION:
         return AudioGeneratorPipeline
     elif task == PipelineTask.SPEECH_TOKEN_GENERATION:
@@ -952,12 +957,12 @@ class PipelineRegistry:
         pipeline_config: PipelineConfig,
         override_architecture: str | None = None,
         task: PipelineTask | None = None,
-    ) -> type[TextGenerationContext] | type[EmbeddingsContext]:
+    ) -> type:
         """Retrieve the context class type associated with the architecture for the given pipeline configuration.
 
         The context type defines how the pipeline manages request state and inputs during
         model execution. Different architectures may use different context implementations
-        that adhere to either the TextGenerationContext or EmbeddingsContext protocol.
+        (TextGenerationContext, EmbeddingsContext, ASRContext, etc.).
 
         Args:
             pipeline_config: The configuration for the pipeline.

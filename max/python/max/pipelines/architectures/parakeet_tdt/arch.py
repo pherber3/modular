@@ -14,19 +14,32 @@
 
 from max.graph.weights import WeightsFormat
 from max.interfaces import PipelineTask
-from max.pipelines.core import TextContext
+from max.pipelines.core import ASRContext
 from max.pipelines.lib import SupportedArchitecture
+from transformers import AutoConfig, PretrainedConfig
 
 from . import weight_adapters
 from .model import ParakeetTDTPipelineModel
 from .model_config import TDTModelConfig
 from .tokenizer import ParakeetTDTTokenizer
 
+
+class ParakeetTDTHFConfig(PretrainedConfig):
+    """HF config stub so AutoConfig.from_pretrained() works with parakeet_tdt."""
+
+    model_type = "parakeet_tdt"
+
+
+try:
+    AutoConfig.register("parakeet_tdt", ParakeetTDTHFConfig)
+except ValueError:
+    pass
+
 parakeet_tdt_arch = SupportedArchitecture(
     name="ParakeetForTDT",
-    task=PipelineTask.EMBEDDINGS_GENERATION,
+    task=PipelineTask.AUDIO_TRANSCRIPTION,
     example_repo_ids=[
-        "nvidia/parakeet-tdt-0.6b-v3",
+        "pherber3/parakeet-tdt-0.6b-v3",
     ],
     default_encoding="float32",
     supported_encodings={
@@ -35,10 +48,12 @@ parakeet_tdt_arch = SupportedArchitecture(
     },
     pipeline_model=ParakeetTDTPipelineModel,
     tokenizer=ParakeetTDTTokenizer,
-    context_type=TextContext,
+    context_type=ASRContext,
     default_weights_format=WeightsFormat.safetensors,
     weight_adapters={
-        WeightsFormat.safetensors: weight_adapters.convert_safetensor_state_dict,
+        WeightsFormat.safetensors: (
+            weight_adapters.convert_safetensor_state_dict
+        ),
     },
     required_arguments={"enable_prefix_caching": False},
     config=TDTModelConfig,

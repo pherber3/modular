@@ -23,6 +23,7 @@ import numpy.typing as npt
 from max.interfaces import (
     AudioGenerationOutput,
     AudioGenerationRequest,
+    AudioTranscriptionOutput,
     BaseContextType,
     EmbeddingsGenerationOutput,
     GenerationStatus,
@@ -34,7 +35,12 @@ from max.interfaces import (
     TextGenerationOutput,
     TextGenerationRequest,
 )
-from max.pipelines.core import TextAndVisionContext, TextContext, TTSContext
+from max.pipelines.core import (
+    ASRContext,
+    TextAndVisionContext,
+    TextContext,
+    TTSContext,
+)
 from max.pipelines.lib import reasoning
 from max.profiler import Tracer
 from max.serve.pipelines.stop_detection import StopDetector
@@ -371,6 +377,35 @@ class TokenGeneratorPipeline(
                     request.request_id,
                     total_sw.elapsed_ms,
                 )
+
+
+class AudioTranscriberPipeline(
+    BasePipeline[ASRContext, TextGenerationRequest, AudioTranscriptionOutput]
+):
+    """Pipeline wrapper for audio transcription (ASR) on the API server side.
+
+    Follows the same pattern as ``encode()`` in ``TokenGeneratorPipeline``:
+    sends a context to the model worker and collects a single response.
+    """
+
+    async def transcribe(
+        self, request: TextGenerationRequest
+    ) -> AudioTranscriptionOutput:
+        """Transcribe audio from the request and return text."""
+        context = await self.tokenizer.new_context(request)
+
+        async for responses in self.model_worker.stream(
+            request.request_id, context
+        ):
+            for response in responses:
+                if isinstance(response, AudioTranscriptionOutput):
+                    return response
+                self.logger.error(
+                    "Unexpected response type for transcription: %s",
+                    type(response).__name__,
+                )
+
+        raise RuntimeError("No transcription response received from worker")
 
 
 class AudioGeneratorPipeline(

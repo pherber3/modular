@@ -14,7 +14,7 @@
 
 from max.graph.weights import WeightsFormat
 from max.interfaces import PipelineTask
-from max.pipelines.core import TextContext
+from max.pipelines.core import ASRContext
 from max.pipelines.lib import SupportedArchitecture
 
 from . import weight_adapters
@@ -24,7 +24,7 @@ from .tokenizer import ParakeetTokenizer
 
 parakeet_arch = SupportedArchitecture(
     name="ParakeetForCTC",
-    task=PipelineTask.EMBEDDINGS_GENERATION,
+    task=PipelineTask.AUDIO_TRANSCRIPTION,
     example_repo_ids=[
         "nvidia/parakeet-ctc-1.1b",
     ],
@@ -35,7 +35,7 @@ parakeet_arch = SupportedArchitecture(
     },
     pipeline_model=ParakeetPipelineModel,
     tokenizer=ParakeetTokenizer,
-    context_type=TextContext,
+    context_type=ASRContext,
     default_weights_format=WeightsFormat.safetensors,
     weight_adapters={
         WeightsFormat.safetensors: weight_adapters.convert_safetensor_state_dict,

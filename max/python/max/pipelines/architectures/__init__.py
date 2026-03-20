@@ -65,6 +65,8 @@ def register_all_models() -> None:
     from .olmo2_modulev3 import olmo2_modulev3_arch
     from .olmo3 import olmo3_arch
     from .olmo_modulev3 import olmo_modulev3_arch
+    from .parakeet import parakeet_arch
+    from .parakeet_tdt import parakeet_tdt_arch
     from .phi3 import phi3_arch
     from .phi3_modulev3 import phi3_modulev3_arch
     from .pixtral import pixtral_arch
@@ -112,6 +114,8 @@ def register_all_models() -> None:
         olmo2_arch,
         olmo2_modulev3_arch,
         olmo3_arch,
+        parakeet_arch,
+        parakeet_tdt_arch,
         phi3_arch,
         phi3_modulev3_arch,
         pixtral_arch,

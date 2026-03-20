@@ -67,6 +67,7 @@ from max.serve.config import Settings
 from max.serve.parser import LlamaToolParser, parse_json_from_text
 from max.serve.pipelines.llm import (
     AudioGeneratorPipeline,
+    AudioTranscriberPipeline,
     TokenGeneratorOutput,
     TokenGeneratorPipeline,
 )
@@ -90,6 +91,7 @@ from max.serve.schemas.openai import (
     CreateCompletionResponse,
     CreateEmbeddingRequest,
     CreateEmbeddingResponse,
+    CreateTranscriptionResponseJson,
     Embedding,
     Error,
     ErrorResponse,
@@ -265,11 +267,13 @@ class OpenAIResponseGenerator(ABC, Generic[_T]):
 
 def get_pipeline(
     request: Request, model_name: str
-) -> TokenGeneratorPipeline | AudioGeneratorPipeline:
+) -> TokenGeneratorPipeline | AudioGeneratorPipeline | AudioTranscriberPipeline:
     app_state: State = request.app.state
-    pipeline: TokenGeneratorPipeline | AudioGeneratorPipeline = (
-        app_state.pipeline
-    )
+    pipeline: (
+        TokenGeneratorPipeline
+        | AudioGeneratorPipeline
+        | AudioTranscriberPipeline
+    ) = app_state.pipeline
 
     models = [pipeline.model_name]
 
@@ -741,7 +745,7 @@ async def openai_parse_chat_completion_request(
             messages.append(
                 TextGenerationRequestMessage(
                     role=m.root.role,
-                    content=m.root.content if m.root.content else "",
+                    content=m.root.content or "",
                 )
             )
 
@@ -1036,10 +1040,12 @@ def _convert_chat_completion_tools_to_token_generator_tools(
 
 
 def _create_response_format(
-    response_format: ResponseFormatText
-    | ResponseFormatJsonObject
-    | ResponseFormatJsonSchema
-    | None,
+    response_format: (
+        ResponseFormatText
+        | ResponseFormatJsonObject
+        | ResponseFormatJsonSchema
+        | None
+    ),
 ) -> TextGenerationResponseFormat | None:
     """Convert OpenAI response format to TextGenerationResponseFormat."""
     if not response_format:
@@ -1371,9 +1377,11 @@ class OpenAICompletionResponseGenerator(
 
                 log_probs = _process_log_probabilities(req_outputs)
                 response_message = "".join(
-                    chunk.decoded_tokens
-                    if chunk.decoded_tokens is not None
-                    else ""
+                    (
+                        chunk.decoded_tokens
+                        if chunk.decoded_tokens is not None
+                        else ""
+                    )
                     for chunk in req_outputs
                 )
                 response_choices.append(
@@ -1431,12 +1439,14 @@ def _is_seq_of_seq_of_int(
 
 
 def get_prompts_from_openai_request(
-    prompt: str
-    | list[str]
-    | list[PromptItem]
-    | list[InputItem]
-    | list[int]
-    | list[list[int]],
+    prompt: (
+        str
+        | list[str]
+        | list[PromptItem]
+        | list[InputItem]
+        | list[int]
+        | list[list[int]]
+    ),
 ) -> Sequence[StringPrompt] | Sequence[IntPrompt]:
     """Extract the prompts from a CreateCompletionRequest
 
@@ -1610,6 +1620,68 @@ async def openai_get_model(model_id: str, request: Request) -> Model:
         return pipeline_model
 
     raise HTTPException(status_code=404)
+
+
+@router.post("/audio/transcriptions", response_model=None)
+async def openai_create_transcription(
+    request: Request,
+) -> CreateTranscriptionResponseJson | Response:
+    """Transcribe audio to text using an ASR model.
+
+    Accepts multipart/form-data with an audio file and returns the
+    transcribed text. Compatible with the OpenAI audio transcription API.
+    """
+    request_id = request.state.request_id
+
+    try:
+        form = await request.form()
+        audio_file = form.get("file")
+        model_name = form.get("model")
+        response_format = form.get("response_format", "json")
+
+        if audio_file is None:
+            raise HTTPException(status_code=400, detail="Missing 'file' field.")
+        if model_name is None:
+            raise HTTPException(
+                status_code=400, detail="Missing 'model' field."
+            )
+
+        audio_bytes = await audio_file.read()
+
+        pipeline = get_pipeline(request, str(model_name))
+        if not isinstance(pipeline, AudioTranscriberPipeline):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_name}' does not support audio transcription.",
+            )
+
+        # The audio bytes are passed as the prompt field. The worker-side
+        # AudioTranscriptionPipeline extracts them from the context.
+        transcription_request = TextGenerationRequest(
+            request_id=RequestID(str(request_id)),
+            model_name=str(model_name),
+            prompt=audio_bytes,
+            timestamp_ns=request.state.request_timer.start_ns,
+            request_path=request.url.path,
+        )
+
+        output = await pipeline.transcribe(transcription_request)
+
+        if response_format == "text":
+            return Response(content=output.text, media_type="text/plain")
+        return CreateTranscriptionResponseJson(text=output.text)
+
+    except _ClientDisconnectedError:
+        logger.info("Client disconnected for request %s", request_id)
+        return Response(status_code=_CLIENT_DISCONNECTED_STATUS_CODE)
+    except HTTPException:
+        raise
+    except (TypeError, ValidationError) as e:
+        logger.exception("Validation error in request %s", request_id)
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        logger.exception("ValueError in request %s", request_id)
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # TODO: This is a temporary hack that does not conform to OpenAI spec.
