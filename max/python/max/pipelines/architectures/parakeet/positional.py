@@ -41,12 +41,19 @@ def compute_relative_position_encoding(
     """
     # Position IDs: [T-1, T-2, ..., 1, 0, -1, ..., -(T-1)]
     pos_length = seq_length * 2 - 1
-    positions = ops.cast(
+    # Build positions as (T-1) - range(0, 2T-1) to keep everything on device.
+    # ops.range produces a device tensor; subtracting it from another device
+    # tensor avoids a CPU scalar ending up in the graph.
+    indices = ops.cast(
         ops.range(0, pos_length, dtype=DType.int64, device=device),
         dtype,
     )
-    offset = ops.cast(seq_length - 1, dtype)
-    positions = offset - positions  # [T-1, T-2, ..., 0, -1, ..., -(T-1)]
+    # (seq_length - 1) as a device scalar via range(seq_length-1, seq_length)
+    offset = ops.cast(
+        ops.range(seq_length - 1, seq_length, dtype=DType.int64, device=device),
+        dtype,
+    )
+    positions = offset - indices  # [T-1, T-2, ..., 0, -1, ..., -(T-1)]
 
     # Inverse frequencies: 1 / (10000^(2i/d))
     half_dim = hidden_size // 2
