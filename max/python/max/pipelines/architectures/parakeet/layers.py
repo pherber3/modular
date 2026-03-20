@@ -23,13 +23,24 @@ from __future__ import annotations
 
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, Weight, ops
-from max.nn.conv import Conv1D
 from max.nn.layer import Module
 from max.nn.linear import Linear
 from max.nn.norm import LayerNorm
 
 from .model_config import ParakeetModelConfig
 from .positional import rel_shift
+
+# ---------------------------------------------------------------------------
+# Weight container (for holding named weights without ops.conv2d)
+# ---------------------------------------------------------------------------
+
+
+class _WeightContainer(Module):
+    """Minimal Module subclass that holds weights for load_state_dict."""
+
+    def __call__(self, x: TensorValue) -> TensorValue:
+        raise NotImplementedError("_WeightContainer is not callable")
+
 
 # ---------------------------------------------------------------------------
 # BatchNorm1d (inference-only)
@@ -127,64 +138,101 @@ class ParakeetConvModule(Module):
     def __init__(self, config: ParakeetModelConfig) -> None:
         super().__init__()
         channels = config.hidden_size
-        kernel_size = config.conv_kernel_size
-        padding = (kernel_size - 1) // 2
+        self.kernel_size = config.conv_kernel_size
+        self.padding = (self.kernel_size - 1) // 2
 
         conv_bias = config.convolution_bias
 
-        self.pointwise_conv1 = Conv1D(
-            kernel_size=1,
-            in_channels=channels,
-            out_channels=2 * channels,
-            dtype=config.dtype,
-            stride=1,
-            padding=0,
-            device=config.device,
+        # Use Linear instead of Conv1D for pointwise (kernel_size=1) to
+        # avoid ops.conv2d which has GPU compilation issues with symbolic
+        # shapes derived from conv subsampling.
+        self.pointwise_conv1 = Linear(
+            channels,
+            2 * channels,
+            config.dtype,
+            config.device,
             has_bias=conv_bias,
-            permute=True,
         )
-        self.depthwise_conv = Conv1D(
-            kernel_size=kernel_size,
-            in_channels=channels,
-            out_channels=channels,
+        # Depthwise conv weights: (kernel_size, 1, channels) in SCF format.
+        # Implemented manually via slice+multiply+sum to avoid ops.conv2d
+        # grouped conv compilation bugs on GPU.
+        # Use a _WeightContainer to hold depthwise weights so that
+        # load_state_dict finds them at "conv.depthwise_conv.weight".
+        self.depthwise_conv = _WeightContainer()
+        self.depthwise_conv.weight = Weight(
+            name="weight",
             dtype=config.dtype,
-            stride=1,
-            padding=padding,
-            num_groups=channels,
+            shape=[self.kernel_size, 1, channels],
             device=config.device,
-            has_bias=conv_bias,
-            permute=True,
         )
+        self.depthwise_conv.bias = None
+        if conv_bias:
+            self.depthwise_conv.bias = Weight(
+                name="bias",
+                dtype=config.dtype,
+                shape=[channels],
+                device=config.device,
+            )
         self.norm = BatchNorm1d(
             channels, dtype=config.dtype, device=config.device
         )
-        self.pointwise_conv2 = Conv1D(
-            kernel_size=1,
-            in_channels=channels,
-            out_channels=channels,
-            dtype=config.dtype,
-            stride=1,
-            padding=0,
-            device=config.device,
+        self.pointwise_conv2 = Linear(
+            channels,
+            channels,
+            config.dtype,
+            config.device,
             has_bias=conv_bias,
-            permute=True,
         )
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        # x: (batch, seq_len, channels) -> transpose for Conv1D
-        x = x.transpose(1, 2)  # (batch, channels, seq_len)
+        # x: (batch, seq_len, channels)
 
-        x = self.pointwise_conv1(x)  # (batch, 2*channels, seq_len)
-        half = x.shape[1] // 2
-        x_a, x_b = ops.split(x, [half, half], axis=1)
-        x = x_a * ops.sigmoid(x_b)  # (batch, channels, seq_len)
+        x = self.pointwise_conv1(x)  # (batch, seq_len, 2*channels)
+        half = x.shape[2] // 2
+        x_a, x_b = ops.split(x, [half, half], axis=2)
+        x = x_a * ops.sigmoid(x_b)  # (batch, seq_len, channels)
 
-        x = self.depthwise_conv(x)
-        x = self.norm(x)
+        # Manual depthwise conv: pad, then slice+multiply+sum over kernel.
+        # x is (batch, seq_len, channels). Pad on the seq_len dim.
+        x = ops.pad(x, [0, 0, self.padding, self.padding, 0, 0])
+        # depthwise_weight is (kernel_size, 1, channels) — squeeze to
+        # (kernel_size, channels) for broadcasting.
+        dw = ops.reshape(self.depthwise_conv.weight, [self.kernel_size, -1])
+        # Sum over kernel positions: each slice is (batch, seq_len, channels)
+        result = (
+            ops.slice_tensor(
+                x,
+                [
+                    slice(None),
+                    slice(0, x.shape[1] - self.kernel_size + 1),
+                    slice(None),
+                ],
+            )
+            * dw[0]
+        )
+        for k in range(1, self.kernel_size):
+            result = (
+                result
+                + ops.slice_tensor(
+                    x,
+                    [
+                        slice(None),
+                        slice(k, x.shape[1] - self.kernel_size + 1 + k),
+                        slice(None),
+                    ],
+                )
+                * dw[k]
+            )
+        x = result
+        if self.depthwise_conv.bias is not None:
+            x = x + self.depthwise_conv.bias
+
+        # BatchNorm expects (batch, channels, length)
+        x = self.norm(x.transpose(1, 2)).transpose(1, 2)
         x = ops.silu(x)
 
-        x = self.pointwise_conv2(x)  # (batch, channels, seq_len)
-        return x.transpose(1, 2)  # (batch, seq_len, channels)
+        x = self.pointwise_conv2(x)  # (batch, seq_len, channels)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -267,20 +315,20 @@ class ParakeetAttention(Module):
             ``(batch, seq_len, hidden_size)``
         """
         batch = hidden_states.shape[0]
-        seq_len = hidden_states.shape[1]
 
         # Project Q, K, V and reshape to (batch, heads, seq_len, head_dim)
+        # Use -1 for seq_len so the compiler infers it independently of batch.
         q = ops.reshape(
             self.q_proj(hidden_states),
-            [batch, seq_len, self.num_heads, self.head_dim],
+            [batch, -1, self.num_heads, self.head_dim],
         ).transpose(1, 2)
         k = ops.reshape(
             self.k_proj(hidden_states),
-            [batch, seq_len, self.num_heads, self.head_dim],
+            [batch, -1, self.num_heads, self.head_dim],
         ).transpose(1, 2)
         v = ops.reshape(
             self.v_proj(hidden_states),
-            [batch, seq_len, self.num_heads, self.head_dim],
+            [batch, -1, self.num_heads, self.head_dim],
         ).transpose(1, 2)
 
         # Bias shapes: (1, num_heads, 1, head_dim) for broadcasting
@@ -305,6 +353,7 @@ class ParakeetAttention(Module):
         matrix_bd = q_with_bias_v @ rel_key.permute([0, 2, 3, 1])
         matrix_bd = rel_shift(matrix_bd)
         # Keep only first seq_len positions
+        seq_len = q.shape[2]  # q is (batch, heads, seq_len, head_dim)
         matrix_bd = ops.slice_tensor(
             matrix_bd,
             [slice(None), slice(None), slice(None), slice(0, seq_len)],
@@ -312,13 +361,26 @@ class ParakeetAttention(Module):
         matrix_bd = matrix_bd * self.scaling
 
         attn_weights = matrix_ac + matrix_bd
-        attn_weights = ops.softmax(attn_weights)
+        # Manual softmax + matmul to avoid flash attention fusion.
+        # The GPU compiler's flash attention kernel crashes with
+        # CUDA_ERROR_MISALIGNED_ADDRESS on conformer-style relative
+        # positional attention.
+        # Manual softmax to avoid flash attention fusion.
+        attn_max = ops.max(attn_weights, axis=-1)
+        # ops.max may keep dims; reshape to ensure [B, H, S, 1]
+        attn_max = ops.reshape(attn_max, [batch, self.num_heads, -1, 1])
+        attn_weights = ops.exp(attn_weights - attn_max)
+        attn_sum = ops.sum(attn_weights, axis=-1)
+        attn_sum = ops.reshape(attn_sum, [batch, self.num_heads, -1, 1])
+        attn_weights = attn_weights / attn_sum
 
         attn_output = attn_weights @ v  # (batch, heads, seq_len, head_dim)
         attn_output = attn_output.transpose(
             1, 2
         )  # (batch, seq_len, heads, head_dim)
-        attn_output = ops.reshape(attn_output, [batch, seq_len, -1])
+        attn_output = ops.reshape(
+            attn_output, [batch, -1, self.num_heads * self.head_dim]
+        )
 
         return self.o_proj(attn_output)
 
