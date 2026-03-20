@@ -73,7 +73,10 @@ def build_graph(
     """
     input_type = TensorType(
         DType.float32,
-        shape=["batch_size", "num_frames", config.num_mel_bins],
+        # Use fixed num_frames to avoid GPU compiler issues with derived
+        # symbolic dimensions from conv subsampling. 3200 frames ≈ 20s audio.
+        # Shorter inputs are padded, longer inputs are truncated.
+        shape=[1, 3200, config.num_mel_bins],
         device=config.device,
     )
 
@@ -184,8 +187,16 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         """
         if self.tdt_config.normalize_features == "per_feature":
             features = normalize_per_feature(features)
+        features = features.astype(np.float32)
+        # Pad or truncate to fixed 3200 frames for GPU compatibility.
+        max_frames = 3200
+        if features.shape[1] < max_frames:
+            pad_width = [(0, 0), (0, max_frames - features.shape[1]), (0, 0)]
+            features = np.pad(features, pad_width)
+        elif features.shape[1] > max_frames:
+            features = features[:, :max_frames, :]
         return ParakeetTDTInputs(
-            input_features=Buffer.from_numpy(features.astype(np.float32))
+            input_features=Buffer.from_numpy(features).to(self.devices[0])
         )
 
     def transcribe(self, audio_bytes: bytes, tokenizer: object) -> str:

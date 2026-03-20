@@ -73,6 +73,27 @@ def _is_subsampling_conv_weight(key: str) -> bool:
     )
 
 
+def _is_conformer_depthwise_weight(key: str) -> bool:
+    """Check if a key is a conformer depthwise conv weight (needs FCS->SCF permute).
+
+    The depthwise conv is implemented manually (not via Conv1D) to avoid
+    GPU compilation bugs. Weights must be pre-permuted from PyTorch
+    (F, C/groups, K) to SCF (K, C/groups, F).
+    """
+    return key.endswith(".weight") and ".conv.depthwise_conv." in key
+
+
+def _is_conformer_pointwise_weight(key: str) -> bool:
+    """Check if a key is a conformer pointwise conv weight (needs squeeze).
+
+    Pointwise convs are replaced with Linear layers. HF stores weights
+    as (F, C, 1); Linear expects (F, C) — squeeze the kernel dim.
+    """
+    return key.endswith(".weight") and (
+        ".conv.pointwise_conv1." in key or ".conv.pointwise_conv2." in key
+    )
+
+
 def convert_safetensor_state_dict(
     state_dict: Mapping[str, Weights],
 ) -> dict[str, WeightData]:
@@ -97,6 +118,23 @@ def convert_safetensor_state_dict(
             arr = np.from_dlpack(weight_data)
             weight_data = WeightData.from_numpy(
                 np.ascontiguousarray(arr.transpose(2, 3, 1, 0)),
+                name=max_name,
+            )
+
+        # Permute conformer depthwise conv weights: FCS -> SCF (K,C,F)
+        if _is_conformer_depthwise_weight(max_name):
+            arr = np.from_dlpack(weight_data)
+            weight_data = WeightData.from_numpy(
+                np.ascontiguousarray(arr.transpose(2, 1, 0)),
+                name=max_name,
+            )
+
+        # Squeeze conformer pointwise conv weights: (F,C,1) -> (F,C)
+        # Pointwise convs are now Linear layers.
+        if _is_conformer_pointwise_weight(max_name):
+            arr = np.from_dlpack(weight_data).copy()
+            weight_data = WeightData.from_numpy(
+                np.ascontiguousarray(arr.squeeze(-1)),
                 name=max_name,
             )
 

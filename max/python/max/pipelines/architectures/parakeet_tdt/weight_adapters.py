@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import numpy as np
 from max.graph.weights import WeightData, Weights
 
 
@@ -38,6 +39,22 @@ def _is_subsampling_conv_weight(key: str) -> bool:
     )
 
 
+def _is_conformer_depthwise_weight(key: str) -> bool:
+    """Check if a key is a conformer depthwise conv weight (needs FCS->SCF permute)."""
+    return key.endswith(".weight") and ".conv.depthwise_conv." in key
+
+
+def _is_conformer_pointwise_weight(key: str) -> bool:
+    """Check if a key is a conformer pointwise conv weight (needs squeeze).
+
+    Pointwise convs are replaced with Linear layers. Weights stored as
+    (F, C, 1) need to be squeezed to (F, C).
+    """
+    return key.endswith(".weight") and (
+        ".conv.pointwise_conv1." in key or ".conv.pointwise_conv2." in key
+    )
+
+
 def convert_safetensor_state_dict(
     state_dict: Mapping[str, Weights],
 ) -> dict[str, WeightData]:
@@ -45,7 +62,8 @@ def convert_safetensor_state_dict(
 
     The heavy lifting (NeMo name remapping, Conv2d permutation) was done
     by ``scripts/convert_nemo.py``. This adapter passes weights through,
-    skipping any unexpected keys.
+    skipping any unexpected keys. Depthwise Conv1D weights are permuted
+    from PyTorch (F,C,K) to MAX (K,C,F) format.
     """
     new_state_dict: dict[str, WeightData] = {}
 
@@ -55,6 +73,24 @@ def convert_safetensor_state_dict(
 
         # Strip "encoder." prefix — ParakeetEncoder is the root module
         max_name = weight_name.removeprefix("encoder.")
-        new_state_dict[max_name] = value.data()
+        weight_data = value.data()
+
+        # Permute conformer depthwise conv weights: FCS -> SCF (K,C,F)
+        if _is_conformer_depthwise_weight(max_name):
+            arr = np.from_dlpack(weight_data)
+            weight_data = WeightData.from_numpy(
+                np.ascontiguousarray(arr.transpose(2, 1, 0)),
+                name=max_name,
+            )
+
+        # Squeeze conformer pointwise conv weights: (F,C,1) -> (F,C)
+        if _is_conformer_pointwise_weight(max_name):
+            arr = np.from_dlpack(weight_data).copy()
+            weight_data = WeightData.from_numpy(
+                np.ascontiguousarray(arr.squeeze(-1)),
+                name=max_name,
+            )
+
+        new_state_dict[max_name] = weight_data
 
     return new_state_dict

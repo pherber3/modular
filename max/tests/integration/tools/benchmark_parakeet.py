@@ -513,6 +513,8 @@ def bench_full_pipeline(
         else:
             n_mels = tdt_model.tdt_config.num_mel_bins
 
+        cpu_dev = load_devices([DeviceSpec.cpu()])[0]
+
         for i in range(n_warmup + n_runs):
             ab = audio_bytes_list[i % len(audio_bytes_list)]
             record = i >= n_warmup
@@ -539,12 +541,23 @@ def bench_full_pipeline(
 
             t0 = time.perf_counter()
             features = normalize_per_feature(features).astype(np.float32)
+            # Pad or truncate to fixed 3200 frames for GPU compatibility.
+            max_frames = 3200
+            if features.shape[1] < max_frames:
+                pad_width = [
+                    (0, 0),
+                    (0, max_frames - features.shape[1]),
+                    (0, 0),
+                ]
+                features = np.pad(features, pad_width)
+            elif features.shape[1] > max_frames:
+                features = features[:, :max_frames, :]
             t1 = time.perf_counter()
             if record:
                 r_norm.times_ms.append((t1 - t0) * 1000)
 
             t0 = time.perf_counter()
-            buf = Buffer.from_numpy(features)
+            buf = Buffer.from_numpy(features).to(devices[0])
             t1 = time.perf_counter()
             if record:
                 r_buffer.times_ms.append((t1 - t0) * 1000)
@@ -561,7 +574,9 @@ def bench_full_pipeline(
                 r_encoder.times_ms.append((t1 - t0) * 1000)
 
             t0 = time.perf_counter()
-            logits = np.from_dlpack(outputs.logits).copy()
+            out_buf = outputs.logits
+            assert out_buf is not None
+            logits = np.from_dlpack(out_buf.to(cpu_dev)).copy()
             t1 = time.perf_counter()
             if record:
                 r_transfer.times_ms.append((t1 - t0) * 1000)
@@ -597,13 +612,10 @@ def bench_full_pipeline(
             r_e2e,
         ]
 
-    except Exception as e:
-        print(f"  Failed to load model: {e}")
-        print("  Run via bazel for full pipeline benchmarks:")
-        print(
-            f"    ./bazelw run //max/tests:benchmark_parakeet -- "
-            f"--model {model_type} --device {device} --stages full"
-        )
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
         return []
 
 
