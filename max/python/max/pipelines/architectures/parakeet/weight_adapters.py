@@ -56,7 +56,7 @@ def _remap_subsampling_index(key: str) -> str:
     if not key.startswith(prefix):
         return key
 
-    rest = key[len(prefix):]
+    rest = key[len(prefix) :]
     dot_pos = rest.index(".")
     hf_idx = rest[:dot_pos]
     suffix = rest[dot_pos:]
@@ -69,8 +69,7 @@ def _remap_subsampling_index(key: str) -> str:
 def _is_subsampling_conv_weight(key: str) -> bool:
     """Check if a key is a subsampling Conv2d weight (needs FCRS->RSCF permute)."""
     return key.endswith(".weight") and (
-        "subsampling.initial_conv." in key
-        or "subsampling.dw_pw_stages." in key
+        "subsampling.initial_conv." in key or "subsampling.dw_pw_stages." in key
     )
 
 

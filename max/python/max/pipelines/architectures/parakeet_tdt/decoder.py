@@ -111,10 +111,14 @@ class PredictionNetwork:
 
     def init_states(self) -> tuple[list[NDFloat], list[NDFloat]]:
         """Initialize hidden and cell states to zeros."""
-        h = [np.zeros(self.pred_hidden, dtype=np.float32)
-             for _ in range(self.num_layers)]
-        c = [np.zeros(self.pred_hidden, dtype=np.float32)
-             for _ in range(self.num_layers)]
+        h = [
+            np.zeros(self.pred_hidden, dtype=np.float32)
+            for _ in range(self.num_layers)
+        ]
+        c = [
+            np.zeros(self.pred_hidden, dtype=np.float32)
+            for _ in range(self.num_layers)
+        ]
         return h, c
 
     def __call__(
@@ -181,9 +185,7 @@ class JointNetwork:
             out_bias=weights["joint.joint_net.2.bias"],
         )
 
-    def __call__(
-        self, encoder_out: NDFloat, predictor_out: NDFloat
-    ) -> NDFloat:
+    def __call__(self, encoder_out: NDFloat, predictor_out: NDFloat) -> NDFloat:
         """Compute joint logits.
 
         Args:

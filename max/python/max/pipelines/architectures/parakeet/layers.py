@@ -199,9 +199,7 @@ class ParakeetAttention(Module):
     ``A = (Q + bias_u) @ K^T + rel_shift((Q + bias_v) @ R^T)``
     """
 
-    def __init__(
-        self, config: ParakeetModelConfig, layer_idx: int
-    ) -> None:
+    def __init__(self, config: ParakeetModelConfig, layer_idx: int) -> None:
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
@@ -286,12 +284,8 @@ class ParakeetAttention(Module):
         ).transpose(1, 2)
 
         # Bias shapes: (1, num_heads, 1, head_dim) for broadcasting
-        bias_u = ops.reshape(
-            self.bias_u, [1, self.num_heads, 1, self.head_dim]
-        )
-        bias_v = ops.reshape(
-            self.bias_v, [1, self.num_heads, 1, self.head_dim]
-        )
+        bias_u = ops.reshape(self.bias_u, [1, self.num_heads, 1, self.head_dim])
+        bias_v = ops.reshape(self.bias_v, [1, self.num_heads, 1, self.head_dim])
 
         # Content attention: (Q + bias_u) @ K^T * scale
         q_with_bias_u = q + bias_u
@@ -337,9 +331,7 @@ class ParakeetAttention(Module):
 class ParakeetConformerLayer(Module):
     """Single Conformer layer with Macaron-style FF-Attn-Conv-FF structure."""
 
-    def __init__(
-        self, config: ParakeetModelConfig, layer_idx: int
-    ) -> None:
+    def __init__(self, config: ParakeetModelConfig, layer_idx: int) -> None:
         super().__init__()
         hidden_size = config.hidden_size
 
@@ -383,9 +375,7 @@ class ParakeetConformerLayer(Module):
         conv_output = self.conv(self.norm_conv(hidden_states))
         hidden_states = hidden_states + conv_output
 
-        ff2_output = self.feed_forward2(
-            self.norm_feed_forward2(hidden_states)
-        )
+        ff2_output = self.feed_forward2(self.norm_feed_forward2(hidden_states))
         hidden_states = hidden_states + ff2_output * 0.5
 
         return self.norm_out(hidden_states)
