@@ -53,6 +53,8 @@ def convert_safetensor_state_dict(
         if "num_batches_tracked" in weight_name:
             continue
 
-        new_state_dict[weight_name] = value.data()
+        # Strip "encoder." prefix — ParakeetEncoder is the root module
+        max_name = weight_name.removeprefix("encoder.")
+        new_state_dict[max_name] = value.data()
 
     return new_state_dict

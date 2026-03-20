@@ -21,6 +21,10 @@ from max.config import (
     resolve_max_config_inheritance,
 )
 
+from .audio_transcription_pipeline import (
+    AudioTranscriptionPipeline,
+    AudioTranscriptionPipelineType,
+)
 from .bfloat16_utils import (
     float32_array_to_buffer,
     float32_to_bfloat16_as_uint16,
@@ -99,6 +103,8 @@ __all__ = [
     "PIPELINE_REGISTRY",
     "AlwaysSignalBuffersMixin",
     "AudioGenerationConfig",
+    "AudioTranscriptionPipeline",
+    "AudioTranscriptionPipelineType",
     "CompilationTimer",
     "DenoisingCacheConfig",
     "EmbeddingsPipeline",

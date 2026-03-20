@@ -21,6 +21,7 @@ shared encoder code works via duck typing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from max.dtype import DType
 from max.graph import DeviceRef
@@ -48,8 +49,12 @@ class TDTModelConfig(ArchConfig):
     # --- Encoder properties ---
 
     @property
-    def encoder_config(self) -> AutoConfig:
-        return self.huggingface_config.encoder_config
+    def encoder_config(self) -> SimpleNamespace:
+        """Encoder config, converting from dict if needed."""
+        ec = self.huggingface_config.encoder_config
+        if isinstance(ec, dict):
+            return SimpleNamespace(**ec)
+        return ec
 
     @property
     def num_hidden_layers(self) -> int:
@@ -110,12 +115,20 @@ class TDTModelConfig(ArchConfig):
     # --- TDT-specific properties ---
 
     @property
-    def decoder_config(self) -> AutoConfig:
-        return self.huggingface_config.decoder_config
+    def decoder_config(self) -> SimpleNamespace:
+        """Decoder config, converting from dict if needed."""
+        dc = self.huggingface_config.decoder_config
+        if isinstance(dc, dict):
+            return SimpleNamespace(**dc)
+        return dc
 
     @property
-    def joint_config(self) -> AutoConfig:
-        return self.huggingface_config.joint_config
+    def joint_config(self) -> SimpleNamespace:
+        """Joint config, converting from dict if needed."""
+        jc = self.huggingface_config.joint_config
+        if isinstance(jc, dict):
+            return SimpleNamespace(**jc)
+        return jc
 
     @property
     def pred_hidden(self) -> int:

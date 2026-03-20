@@ -18,6 +18,12 @@ from .audio_generation import (
     AudioGenerationOutput,
     AudioGenerationRequest,
 )
+from .audio_transcription import (
+    AudioTranscriptionContext,
+    AudioTranscriptionContextType,
+    AudioTranscriptionInputs,
+    AudioTranscriptionOutput,
+)
 from .embeddings_generation import (
     EmbeddingsContext,
     EmbeddingsGenerationContextType,
@@ -55,6 +61,10 @@ __all__ = [
     "AudioGenerationMetadata",
     "AudioGenerationOutput",
     "AudioGenerationRequest",
+    "AudioTranscriptionContext",
+    "AudioTranscriptionContextType",
+    "AudioTranscriptionInputs",
+    "AudioTranscriptionOutput",
     "BatchType",
     "EmbeddingsContext",
     "EmbeddingsGenerationContextType",

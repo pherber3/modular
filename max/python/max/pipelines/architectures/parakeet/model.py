@@ -39,6 +39,7 @@ from max.pipelines.lib import (
 )
 from transformers import AutoConfig, PreTrainedTokenizer
 
+from .audio import extract_mel, normalize_per_feature, read_wav
 from .decode import ctc_greedy_decode
 from .graph import build_graph
 from .model_config import ParakeetModelConfig
@@ -111,6 +112,32 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
         assert outputs.logits is not None
         logits = np.from_dlpack(outputs.logits).copy()
         return ctc_greedy_decode(logits, tokenizer, blank_id=1024)
+
+    def transcribe(
+        self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer
+    ) -> str:
+        """Full audio-to-text pipeline: mel extraction → encoder → CTC decode."""
+        audio_data, sample_rate = read_wav(audio_bytes)
+        if sample_rate != 16000:
+            raise ValueError(
+                f"Expected 16kHz audio, got {sample_rate}Hz. "
+                "Please resample before sending."
+            )
+
+        config = ParakeetModelConfig.initialize(self.pipeline_config)
+        features = extract_mel(
+            audio_data,
+            n_mels=config.num_mel_bins,
+            preemphasis=0.97,
+            periodic_window=False,
+        )
+        features = normalize_per_feature(features)
+
+        model_inputs = ParakeetInputs(
+            input_features=Buffer.from_numpy(features)
+        )
+        texts = self.decode(model_inputs, tokenizer)
+        return texts[0]
 
     def prepare_initial_token_inputs(
         self,

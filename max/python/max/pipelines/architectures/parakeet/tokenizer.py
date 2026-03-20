@@ -19,15 +19,34 @@ back to text). The blank token (CTC) is at index vocab_size - 1 = 1024.
 
 from __future__ import annotations
 
+from max.interfaces import RequestID, TextGenerationRequest
+from max.pipelines.core import ASRContext
 from max.pipelines.lib import TextTokenizer
 
 
 class ParakeetTokenizer(TextTokenizer):
     @property
     def eos(self) -> int:
-        # CTC blank token is the last token in the vocabulary.
         if self.delegate.eos_token_id is not None:
             return self.delegate.eos_token_id
         if self.delegate.pad_token_id is not None:
             return self.delegate.pad_token_id
         return 1024
+
+    async def new_context(
+        self, request: TextGenerationRequest
+    ) -> ASRContext:
+        """Create an ASR context carrying audio bytes from the request.
+
+        The route passes raw audio bytes via ``request.prompt``.
+        """
+        audio_data = request.prompt
+        if not isinstance(audio_data, bytes):
+            raise TypeError(
+                f"Expected audio bytes in prompt, got {type(audio_data).__name__}"
+            )
+        return ASRContext(
+            request_id=RequestID(str(request.request_id)),
+            audio_data=audio_data,
+            model_name=request.model_name,
+        )

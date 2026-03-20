@@ -60,6 +60,8 @@ class PipelineTask(str, Enum):
     """Task for generating pixels."""
     UNDEFINED = "undefined"
     """Undefined task, used as default when task should be auto-detected."""
+    AUDIO_TRANSCRIPTION = "audio_transcription"
+    """Task for transcribing audio to text."""
 
     @property
     def output_type(
@@ -73,6 +75,7 @@ class PipelineTask(str, Enum):
         from .generation import GenerationOutput
         from .pipeline_variants import (
             AudioGenerationOutput,
+            AudioTranscriptionOutput,
             EmbeddingsGenerationOutput,
             TextGenerationOutput,
         )
@@ -87,6 +90,8 @@ class PipelineTask(str, Enum):
             return dict[RequestID, SchedulerResult[EmbeddingsGenerationOutput]]
         elif self == PipelineTask.AUDIO_GENERATION:
             return dict[RequestID, SchedulerResult[AudioGenerationOutput]]
+        elif self == PipelineTask.AUDIO_TRANSCRIPTION:
+            return dict[RequestID, SchedulerResult[AudioTranscriptionOutput]]
         elif self == PipelineTask.PIXEL_GENERATION:
             return dict[RequestID, SchedulerResult[GenerationOutput]]
         else:

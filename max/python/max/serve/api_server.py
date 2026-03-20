@@ -44,6 +44,7 @@ from max.serve.config import APIType, MetricRecordingMethod, Settings
 from max.serve.pipelines.general_handler import GeneralPipelineHandler
 from max.serve.pipelines.llm import (
     AudioGeneratorPipeline,
+    AudioTranscriberPipeline,
     TokenGeneratorPipeline,
 )
 from max.serve.pipelines.model_worker import start_model_worker
@@ -183,6 +184,11 @@ async def lifespan(
                 lora_queue=lora_queue,
                 model_worker=model_worker,
             ),
+            PipelineTask.AUDIO_TRANSCRIPTION: lambda: AudioTranscriberPipeline(
+                model_name=serving_settings.pipeline_config.model.model_name,
+                tokenizer=serving_settings.tokenizer,
+                model_worker=model_worker,
+            ),
             PipelineTask.AUDIO_GENERATION: lambda: AudioGeneratorPipeline(
                 model_name=serving_settings.pipeline_config.model.model_name,
                 tokenizer=serving_settings.tokenizer,
@@ -309,7 +315,9 @@ def fastapi_app(
 
     async def reset_prefix_cache() -> Response:
         """Reset the prefix cache."""
-        if not serving_settings.pipeline_config.model.kv_cache.enable_prefix_caching:
+        if (
+            not serving_settings.pipeline_config.model.kv_cache.enable_prefix_caching
+        ):
             return Response(
                 status_code=400,
                 content="Prefix caching is not enabled. Ignoring request",

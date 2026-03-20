@@ -828,3 +828,70 @@ if TYPE_CHECKING:
             request_id=RequestID(),
             tokens=TokenBuffer(np.array([0], dtype=np.int64)),
         )
+
+
+@contextmanager
+def reserve_token_space_for_batch(
+    batch: list[TextContext],
+    num_tokens: int,
+) -> Iterator[None]:
+    """Reserves token space for each context in a batch for the duration of the context.
+
+    Increments each context's token buffer processing range end and current length
+    by ``num_tokens``; restores them on exit.
+
+    Args:
+        batch: List of TextContext objects to reserve space for.
+        num_tokens: Number of tokens to reserve for each context.
+
+    Yields:
+        None
+    """
+    if num_tokens == 0:
+        yield
+
+    saved_state: dict[RequestID, tuple[int, int]] = {
+        ctx.request_id: (
+            ctx.tokens._processing_range.end,
+            ctx.tokens._current_length,
+        )
+        for ctx in batch
+    }
+
+    try:
+        for ctx in batch:
+            ctx.tokens._processing_range.bump_end(num_tokens)
+
+            new_length = ctx.tokens._current_length + num_tokens
+            if new_length < 0:
+                raise ValueError(
+                    f"Logical length {ctx.tokens._current_length} + num_tokens {num_tokens} must be >= 0"
+                )
+            ctx.tokens._expand_capacity(min_capacity=new_length)
+            ctx.tokens._current_length = new_length
+        yield
+    finally:
+        for ctx in batch:
+            proc_end, cur_len = saved_state[ctx.request_id]
+            ctx.tokens._processing_range.end = proc_end
+            ctx.tokens._current_length = cur_len
+
+
+@dataclass(kw_only=True)
+class ASRContext:
+    """Context for audio transcription (ASR) pipelines.
+
+    Carries raw audio bytes from the API route to the worker process.
+    Implements the ``AudioTranscriptionContext`` protocol.
+    """
+
+    request_id: RequestID
+    audio_data: bytes
+    model_name: str
+    language: str | None = None
+    status: GenerationStatus = GenerationStatus.ACTIVE
+
+    @property
+    def is_done(self) -> bool:
+        """Whether this transcription request has completed."""
+        return self.status.is_done

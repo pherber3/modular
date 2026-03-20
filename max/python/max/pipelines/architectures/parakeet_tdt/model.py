@@ -22,8 +22,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
+import huggingface_hub
 import numpy as np
 import numpy.typing as npt
 from max.driver import Buffer, Device, DLPackArray
@@ -44,6 +44,7 @@ from max.pipelines.lib import (
 )
 from transformers import AutoConfig
 
+from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
 from ..parakeet.encoder import ParakeetEncoder
 from .decode import tdt_greedy_decode
 from .decoder import JointNetwork, PredictionNetwork
@@ -52,25 +53,6 @@ from .model_config import TDTModelConfig
 NDFloat = npt.NDArray[np.floating]
 
 logger = logging.getLogger("max.pipelines")
-
-
-def normalize_mel_features(features: NDFloat, mode: str | None) -> NDFloat:
-    """Apply feature normalization matching NeMo's preprocessor.
-
-    Args:
-        features: Mel spectrogram of shape ``(batch, num_frames, num_mel_bins)``.
-        mode: Normalization mode from config. ``"per_feature"`` normalizes
-            each mel bin to zero mean / unit variance per utterance.
-            ``None`` or other values are no-ops.
-
-    Returns:
-        Normalized features, same shape as input.
-    """
-    if mode == "per_feature":
-        mean = features.mean(axis=1, keepdims=True)
-        std = features.std(axis=1, keepdims=True)
-        features = (features - mean) / (std + 1e-5)
-    return features
 
 
 @dataclass
@@ -139,13 +121,9 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
 
     def _load_decoder_weights(self, config: TDTModelConfig) -> None:
         """Load LSTM prediction network and joint network from npz file."""
-        model_path = self.pipeline_config.model.model_path
-        npz_path = Path(model_path) / "decoder_joint.npz"
-        if not npz_path.exists():
-            raise FileNotFoundError(
-                f"Decoder weights not found at {npz_path}. "
-                "Run scripts/convert_nemo.py first."
-            )
+        npz_path = huggingface_hub.hf_hub_download(
+            self.pipeline_config.model.model_path, "decoder_joint.npz"
+        )
         weights = dict(np.load(npz_path))
         self.prediction_net = PredictionNetwork.from_npz(weights)
         self.joint_net = JointNetwork.from_npz(weights)
@@ -206,12 +184,25 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         Returns:
             Model inputs ready for :meth:`execute` or :meth:`decode`.
         """
-        features = normalize_mel_features(
-            features, self.tdt_config.normalize_features
-        )
+        if self.tdt_config.normalize_features == "per_feature":
+            features = normalize_per_feature(features)
         return ParakeetTDTInputs(
             input_features=Buffer.from_numpy(features.astype(np.float32))
         )
+
+    def transcribe(self, audio_bytes: bytes, tokenizer: object) -> str:
+        """Full audio-to-text pipeline: mel extraction → encoder → TDT decode."""
+        audio, sample_rate = read_wav(audio_bytes)
+        if sample_rate != 16000:
+            raise ValueError(
+                f"Expected 16kHz audio, got {sample_rate}Hz. "
+                "Please resample before sending."
+            )
+
+        features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)
+        model_inputs = self.prepare_mel_input(features)
+        token_ids_batch = self.decode(model_inputs)
+        return tokenizer.decode(token_ids_batch[0], skip_special_tokens=True)
 
     def prepare_initial_token_inputs(
         self,
