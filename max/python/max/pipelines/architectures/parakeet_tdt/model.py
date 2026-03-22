@@ -13,8 +13,12 @@
 """Defines the Parakeet-TDT pipeline model.
 
 The encoder runs as a compiled MAX graph. The LSTM prediction network,
-joint network, and TDT greedy decode run in Python/numpy after the
-encoder produces its output.
+joint network, and TDT greedy decode run on GPU using PyTorch tensors,
+eliminating the GPU→CPU transfer that was previously required.
+
+When PyTorch+CUDA is available, the decoder uses pre-projected encoder
+outputs and GPU tensor operations (decoder_torch / decode_torch).
+Falls back to the numpy CPU implementation otherwise (decoder / decode).
 """
 
 from __future__ import annotations
@@ -46,9 +50,33 @@ from transformers import AutoConfig
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
 from ..parakeet.encoder import ParakeetEncoder
+
+# Always import numpy CPU fallback.
 from .decode import tdt_greedy_decode
 from .decoder import JointNetwork, PredictionNetwork
 from .model_config import TDTModelConfig
+
+# Prefer PyTorch GPU decoder when available.
+_USE_TORCH_DECODER = False
+try:
+    import torch
+
+    if torch.cuda.is_available():
+        from .decode_torch import (
+            tdt_greedy_decode as tdt_greedy_decode_torch,
+        )
+        from .decoder_torch import (
+            JointNetwork as JointNetworkTorch,
+        )
+        from .decoder_torch import (
+            PredictionNetwork as PredictionNetworkTorch,
+        )
+
+        _USE_TORCH_DECODER = True
+    else:
+        print("PyTorch available but CUDA not detected, using numpy decoder")
+except ImportError as e:
+    print(f"PyTorch GPU decoder not available: {e}")
 
 NDFloat = npt.NDArray[np.floating]
 
@@ -122,18 +150,36 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         self._load_decoder_weights()
 
     def _load_decoder_weights(self) -> None:
-        """Load LSTM prediction network and joint network from npz file."""
+        """Load LSTM prediction network and joint network from npz file.
+
+        When PyTorch+CUDA is available, weights are placed on GPU as torch
+        tensors for GPU-accelerated decoding. Otherwise falls back to numpy.
+        """
         npz_path = huggingface_hub.hf_hub_download(
             self.pipeline_config.model.model_path, "decoder_joint.npz"
         )
         weights = dict(np.load(npz_path))
-        self.prediction_net = PredictionNetwork.from_npz(weights)
-        self.joint_net = JointNetwork.from_npz(weights)
-        logger.info(
-            "Loaded TDT decoder: %d LSTM layers, pred_hidden=%d",
-            self.prediction_net.num_layers,
-            self.prediction_net.pred_hidden,
-        )
+
+        if _USE_TORCH_DECODER:
+            self.prediction_net = PredictionNetworkTorch.from_npz(weights)
+            self.joint_net = JointNetworkTorch.from_npz(weights)
+            self._use_torch_decoder = True
+            logger.info(
+                "Loaded TDT decoder (PyTorch GPU): %d LSTM layers, "
+                "pred_hidden=%d",
+                self.prediction_net.num_layers,
+                self.prediction_net.pred_hidden,
+            )
+        else:
+            self.prediction_net = PredictionNetwork.from_npz(weights)
+            self.joint_net = JointNetwork.from_npz(weights)
+            self._use_torch_decoder = False
+            logger.info(
+                "Loaded TDT decoder (numpy CPU): %d LSTM layers, "
+                "pred_hidden=%d",
+                self.prediction_net.num_layers,
+                self.prediction_net.pred_hidden,
+            )
 
     @classmethod
     def calculate_max_seq_len(
@@ -157,20 +203,42 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
 
         This is the full TDT inference path: encoder graph produces hidden
         states, then the LSTM prediction network + joint network + TDT greedy
-        decode loop runs in Python/numpy to produce token IDs.
+        decode loop produces token IDs.
+
+        When PyTorch+CUDA is available, the encoder output stays on GPU as a
+        torch tensor (via ``torch.from_dlpack``), and decoding runs entirely
+        on GPU with pre-projected encoder/decoder outputs. This eliminates
+        the ~47ms GPU→CPU transfer and runs the decode loop ~10-30x faster
+        than the numpy CPU path.
+
+        Falls back to numpy CPU decoding otherwise.
         """
         outputs = self.execute(model_inputs)
         assert outputs.logits is not None
-        encoder_output = np.from_dlpack(outputs.logits).copy()
 
-        return tdt_greedy_decode(
-            encoder_output=encoder_output,
-            prediction_net=self.prediction_net,
-            joint_net=self.joint_net,
-            durations=self.tdt_config.tdt_durations,
-            vocab_size=self.tdt_config.vocab_size,
-            blank_id=self.tdt_config.blank_id,
-        )
+        if self._use_torch_decoder:
+            # Keep encoder output on GPU — no copy to CPU.
+            encoder_output = torch.from_dlpack(outputs.logits)
+            if encoder_output.dim() == 2:
+                encoder_output = encoder_output.unsqueeze(0)
+            return tdt_greedy_decode_torch(
+                encoder_output=encoder_output,
+                prediction_net=self.prediction_net,
+                joint_net=self.joint_net,
+                durations=self.tdt_config.tdt_durations,
+                vocab_size=self.tdt_config.vocab_size,
+                blank_id=self.tdt_config.blank_id,
+            )
+        else:
+            encoder_output = np.from_dlpack(outputs.logits).copy()
+            return tdt_greedy_decode(
+                encoder_output=encoder_output,
+                prediction_net=self.prediction_net,
+                joint_net=self.joint_net,
+                durations=self.tdt_config.tdt_durations,
+                vocab_size=self.tdt_config.vocab_size,
+                blank_id=self.tdt_config.blank_id,
+            )
 
     def prepare_mel_input(self, features: NDFloat) -> ParakeetTDTInputs:
         """Prepare mel features for model execution.

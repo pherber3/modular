@@ -446,23 +446,8 @@ modular_py_binary(
         requirement("huggingface-hub"),
         requirement("numpy"),
         requirement("sentencepiece"),
+        requirement("torch"),
         requirement("transformers"),
-    ],
-)
-
-modular_py_binary(
-    name = "debug_gpu_compile",
-    testonly = True,
-    srcs = ["debug_gpu_compile.py"],
-    imports = ["."],
-    main = "debug_gpu_compile.py",
-    tags = ["no-pydeps"],
-    deps = [
-        "//max/python/max/driver",
-        "//max/python/max/engine",
-        "//max/python/max/graph",
-        "//max/python/max/pipelines/architectures",
-        requirement("numpy"),
     ],
 )
 

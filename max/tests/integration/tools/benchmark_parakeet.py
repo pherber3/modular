@@ -365,6 +365,148 @@ def bench_tdt_decode(n_warmup: int, n_runs: int) -> list[TimingResult]:
     return [r_lstm, r_joint, r_loop]
 
 
+def bench_tdt_decode_torch(n_warmup: int, n_runs: int) -> list[TimingResult]:
+    """Benchmark TDT decode using PyTorch GPU tensors (if available)."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            print(
+                f"  CUDA not available (torch {torch.__version__}), "
+                "skipping torch decode benchmark"
+            )
+            return []
+        print(
+            f"  Using torch {torch.__version__} with CUDA {torch.version.cuda}"
+        )
+    except ImportError as e:
+        print(f"  PyTorch not available ({e}), skipping torch decode benchmark")
+        return []
+
+    from max.pipelines.architectures.parakeet_tdt.decode_torch import (
+        tdt_greedy_decode as tdt_greedy_decode_torch,
+    )
+    from max.pipelines.architectures.parakeet_tdt.decoder_torch import (
+        JointNetwork as JointNetworkTorch,
+    )
+    from max.pipelines.architectures.parakeet_tdt.decoder_torch import (
+        LSTMCell as LSTMCellTorch,
+    )
+    from max.pipelines.architectures.parakeet_tdt.decoder_torch import (
+        PredictionNetwork as PredictionNetworkTorch,
+    )
+
+    rng = np.random.default_rng(42)
+    pred_hidden = 640
+    encoder_hidden = 1024
+    joint_hidden = 640
+    vocab_size = 1024
+    device = "cuda"
+
+    def _t(arr: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(arr).to(device)
+
+    cells = []
+    for _ in range(2):
+        cells.append(
+            LSTMCellTorch(
+                weight_ih=_t(
+                    rng.standard_normal((4 * pred_hidden, pred_hidden)).astype(
+                        np.float32
+                    )
+                ),
+                weight_hh=_t(
+                    rng.standard_normal((4 * pred_hidden, pred_hidden)).astype(
+                        np.float32
+                    )
+                ),
+                bias_ih=_t(
+                    rng.standard_normal(4 * pred_hidden).astype(np.float32)
+                ),
+                bias_hh=_t(
+                    rng.standard_normal(4 * pred_hidden).astype(np.float32)
+                ),
+            )
+        )
+    pred_net = PredictionNetworkTorch(
+        embedding_weight=_t(
+            rng.standard_normal((vocab_size + 1, pred_hidden)).astype(
+                np.float32
+            )
+        ),
+        lstm_cells=cells,
+    )
+    joint_net = JointNetworkTorch(
+        enc_weight=_t(
+            rng.standard_normal((joint_hidden, encoder_hidden)).astype(
+                np.float32
+            )
+        ),
+        enc_bias=_t(rng.standard_normal(joint_hidden).astype(np.float32)),
+        pred_weight=_t(
+            rng.standard_normal((joint_hidden, pred_hidden)).astype(np.float32)
+        ),
+        pred_bias=_t(rng.standard_normal(joint_hidden).astype(np.float32)),
+        out_weight=_t(
+            rng.standard_normal((vocab_size + 1 + 5, joint_hidden)).astype(
+                np.float32
+            )
+        ),
+        out_bias=_t(rng.standard_normal(vocab_size + 1 + 5).astype(np.float32)),
+    )
+
+    # Individual LSTM step on GPU
+    r_lstm = TimingResult("torch_lstm_step (2 layers, 640-dim, GPU)")
+    h_states, c_states = pred_net.init_states()
+    for i in range(n_warmup + n_runs):
+        t0 = time.perf_counter()
+        _, h_states, c_states = pred_net(0, h_states, c_states)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        if i >= n_warmup:
+            r_lstm.times_ms.append((t1 - t0) * 1000)
+
+    # Individual joint step on GPU (pre-projected path)
+    r_joint = TimingResult("torch_joint_step (pre-projected, GPU)")
+    enc_proj = _t(rng.standard_normal(joint_hidden).astype(np.float32))
+    pred_proj = _t(rng.standard_normal(joint_hidden).astype(np.float32))
+    for i in range(n_warmup + n_runs):
+        t0 = time.perf_counter()
+        joint_net.joint_after_projection(enc_proj, pred_proj)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        if i >= n_warmup:
+            r_joint.times_ms.append((t1 - t0) * 1000)
+
+    # Full decode loop on GPU
+    r_loop = TimingResult("torch_tdt_full_decode_loop (GPU)")
+    encoder_outputs = [
+        _t(
+            rng.standard_normal((1, 100 + i * 30, encoder_hidden)).astype(
+                np.float32
+            )
+        )
+        for i in range(10)
+    ]
+    for i in range(n_warmup + n_runs):
+        enc = encoder_outputs[i % len(encoder_outputs)]
+        t0 = time.perf_counter()
+        tdt_greedy_decode_torch(
+            encoder_output=enc,
+            prediction_net=pred_net,
+            joint_net=joint_net,
+            durations=[0, 1, 2, 3, 4],
+            vocab_size=vocab_size,
+            blank_id=vocab_size,
+        )
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        if i >= n_warmup:
+            r_loop.times_ms.append((t1 - t0) * 1000)
+
+    return [r_lstm, r_joint, r_loop]
+
+
 # ---------------------------------------------------------------------------
 # Full pipeline benchmark (requires model loaded via bazel)
 # ---------------------------------------------------------------------------
@@ -499,6 +641,15 @@ def bench_full_pipeline(
                 ),
             )
 
+        # Import torch decode if available (for GPU TDT path)
+        try:
+            import torch
+            from max.pipelines.architectures.parakeet_tdt.decode_torch import (
+                tdt_greedy_decode as tdt_greedy_decode_torch,
+            )
+        except ImportError:
+            pass
+
         # Load tokenizer
         from transformers import AutoTokenizer
 
@@ -573,29 +724,60 @@ def bench_full_pipeline(
             if record:
                 r_encoder.times_ms.append((t1 - t0) * 1000)
 
-            t0 = time.perf_counter()
-            out_buf = outputs.logits
-            assert out_buf is not None
-            logits = np.from_dlpack(out_buf.to(cpu_dev)).copy()
-            t1 = time.perf_counter()
-            if record:
-                r_transfer.times_ms.append((t1 - t0) * 1000)
-
-            t0 = time.perf_counter()
             if model_type == "ctc":
+                t0 = time.perf_counter()
+                out_buf = outputs.logits
+                assert out_buf is not None
+                logits = np.from_dlpack(out_buf.to(cpu_dev)).copy()
+                t1 = time.perf_counter()
+                if record:
+                    r_transfer.times_ms.append((t1 - t0) * 1000)
+
+                t0 = time.perf_counter()
                 ctc_greedy_decode(logits, tokenizer, blank_id=1024)
+                t1 = time.perf_counter()
+                if record:
+                    r_decode.times_ms.append((t1 - t0) * 1000)
             else:
-                tdt_greedy_decode(
-                    encoder_output=logits,
-                    prediction_net=tdt_model.prediction_net,
-                    joint_net=tdt_model.joint_net,
-                    durations=tdt_model.tdt_config.tdt_durations,
-                    vocab_size=tdt_model.tdt_config.vocab_size,
-                    blank_id=tdt_model.tdt_config.blank_id,
-                )
-            t1 = time.perf_counter()
-            if record:
-                r_decode.times_ms.append((t1 - t0) * 1000)
+                # Transfer + decode: use torch GPU path when available,
+                # otherwise copy to CPU and use numpy.
+                assert outputs.logits is not None
+                t0 = time.perf_counter()
+                if tdt_model._use_torch_decoder:
+                    encoder_output = torch.from_dlpack(outputs.logits)
+                    if encoder_output.dim() == 2:
+                        encoder_output = encoder_output.unsqueeze(0)
+                    t1 = time.perf_counter()
+                    if record:
+                        r_transfer.times_ms.append((t1 - t0) * 1000)
+
+                    t0 = time.perf_counter()
+                    tdt_greedy_decode_torch(
+                        encoder_output=encoder_output,
+                        prediction_net=tdt_model.prediction_net,
+                        joint_net=tdt_model.joint_net,
+                        durations=tdt_model.tdt_config.tdt_durations,
+                        vocab_size=tdt_model.tdt_config.vocab_size,
+                        blank_id=tdt_model.tdt_config.blank_id,
+                    )
+                else:
+                    logits = np.from_dlpack(outputs.logits.to(cpu_dev)).copy()
+                    t1 = time.perf_counter()
+                    if record:
+                        r_transfer.times_ms.append((t1 - t0) * 1000)
+
+                    t0 = time.perf_counter()
+                    tdt_greedy_decode(
+                        encoder_output=logits,
+                        prediction_net=tdt_model.prediction_net,  # type: ignore[arg-type]
+                        joint_net=tdt_model.joint_net,  # type: ignore[arg-type]
+                        durations=tdt_model.tdt_config.tdt_durations,
+                        vocab_size=tdt_model.tdt_config.vocab_size,
+                        blank_id=tdt_model.tdt_config.blank_id,
+                    )
+                t1 = time.perf_counter()
+                if record:
+                    r_decode.times_ms.append((t1 - t0) * 1000)
 
             e2e_end = time.perf_counter()
             if record:
@@ -702,8 +884,10 @@ def main() -> None:
             print("Benchmarking CTC decode...")
             results.append(bench_ctc_decode(args.warmup, args.runs))
         if "tdt" in models:
-            print("Benchmarking TDT decode...")
+            print("Benchmarking TDT decode (numpy/CPU)...")
             results.extend(bench_tdt_decode(args.warmup, args.runs))
+            print("Benchmarking TDT decode (torch/GPU)...")
+            results.extend(bench_tdt_decode_torch(args.warmup, args.runs))
 
     if run_all or "full" in stages:
         for m in models:
