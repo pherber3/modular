@@ -532,9 +532,6 @@ def bench_full_pipeline(
         read_wav,
     )
     from max.pipelines.architectures.parakeet.decode import ctc_greedy_decode
-    from max.pipelines.architectures.parakeet_tdt.decode import (
-        tdt_greedy_decode,
-    )
 
     r_wav = TimingResult(f"read_wav ({model_type})")
     r_mel = TimingResult(f"extract_mel ({model_type})")
@@ -641,15 +638,6 @@ def bench_full_pipeline(
                 ),
             )
 
-        # Import torch decode if available (for GPU TDT path)
-        try:
-            import torch
-            from max.pipelines.architectures.parakeet_tdt.decode_torch import (
-                tdt_greedy_decode as tdt_greedy_decode_torch,
-            )
-        except ImportError:
-            pass
-
         # Load tokenizer
         from transformers import AutoTokenizer
 
@@ -739,42 +727,16 @@ def bench_full_pipeline(
                 if record:
                     r_decode.times_ms.append((t1 - t0) * 1000)
             else:
-                # Transfer + decode: use torch GPU path when available,
-                # otherwise copy to CPU and use numpy.
+                # TDT: graph decoder handles projection + decode on-device.
+                # Transfer time is near-zero (only logits per step).
                 assert outputs.logits is not None
                 t0 = time.perf_counter()
-                if tdt_model._use_torch_decoder:
-                    encoder_output = torch.from_dlpack(outputs.logits)
-                    if encoder_output.dim() == 2:
-                        encoder_output = encoder_output.unsqueeze(0)
-                    t1 = time.perf_counter()
-                    if record:
-                        r_transfer.times_ms.append((t1 - t0) * 1000)
+                t1 = time.perf_counter()
+                if record:
+                    r_transfer.times_ms.append((t1 - t0) * 1000)
 
-                    t0 = time.perf_counter()
-                    tdt_greedy_decode_torch(
-                        encoder_output=encoder_output,
-                        prediction_net=tdt_model.prediction_net,
-                        joint_net=tdt_model.joint_net,
-                        durations=tdt_model.tdt_config.tdt_durations,
-                        vocab_size=tdt_model.tdt_config.vocab_size,
-                        blank_id=tdt_model.tdt_config.blank_id,
-                    )
-                else:
-                    logits = np.from_dlpack(outputs.logits.to(cpu_dev)).copy()
-                    t1 = time.perf_counter()
-                    if record:
-                        r_transfer.times_ms.append((t1 - t0) * 1000)
-
-                    t0 = time.perf_counter()
-                    tdt_greedy_decode(
-                        encoder_output=logits,
-                        prediction_net=tdt_model.prediction_net,  # type: ignore[arg-type]
-                        joint_net=tdt_model.joint_net,  # type: ignore[arg-type]
-                        durations=tdt_model.tdt_config.tdt_durations,
-                        vocab_size=tdt_model.tdt_config.vocab_size,
-                        blank_id=tdt_model.tdt_config.blank_id,
-                    )
+                t0 = time.perf_counter()
+                tdt_model.graph_decoder.decode(outputs.logits)
                 t1 = time.perf_counter()
                 if record:
                     r_decode.times_ms.append((t1 - t0) * 1000)
@@ -824,8 +786,8 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=None)
     parser.add_argument(
         "--stages",
-        default="preprocess,decode",
-        help="Comma-separated: preprocess,decode,full,all",
+        default="preprocess,full",
+        help="Comma-separated: preprocess,full,decode_micro,all",
     )
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
@@ -879,14 +841,16 @@ def main() -> None:
                 )
             )
 
-    if run_all or "decode" in stages:
+    if "decode_micro" in stages:
+        # Micro-benchmarks with synthetic weights — for profiling individual
+        # ops, not representative of real decode performance.
         if "ctc" in models:
-            print("Benchmarking CTC decode...")
+            print("Benchmarking CTC decode (synthetic)...")
             results.append(bench_ctc_decode(args.warmup, args.runs))
         if "tdt" in models:
-            print("Benchmarking TDT decode (numpy/CPU)...")
+            print("Benchmarking TDT decode micro (numpy/CPU)...")
             results.extend(bench_tdt_decode(args.warmup, args.runs))
-            print("Benchmarking TDT decode (torch/GPU)...")
+            print("Benchmarking TDT decode micro (torch/GPU)...")
             results.extend(bench_tdt_decode_torch(args.warmup, args.runs))
 
     if run_all or "full" in stages:
