@@ -427,6 +427,22 @@ PIPELINE_SPECS = [
 ]
 
 modular_py_binary(
+    name = "gpu_compiler_repro",
+    testonly = True,
+    srcs = ["gpu_compiler_repro.py"],
+    imports = ["."],
+    main = "gpu_compiler_repro.py",
+    tags = ["no-pydeps"],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        requirement("numpy"),
+    ],
+)
+
+modular_py_binary(
     name = "benchmark_parakeet",
     testonly = True,
     srcs = ["benchmark_parakeet.py"],

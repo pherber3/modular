@@ -12,13 +12,11 @@
 # ===----------------------------------------------------------------------=== #
 """Defines the Parakeet-TDT pipeline model.
 
-The encoder runs as a compiled MAX graph. The LSTM prediction network,
-joint network, and TDT greedy decode run on GPU using PyTorch tensors,
-eliminating the GPU→CPU transfer that was previously required.
-
-When PyTorch+CUDA is available, the decoder uses pre-projected encoder
-outputs and GPU tensor operations (decoder_torch / decode_torch).
-Falls back to the numpy CPU implementation otherwise (decoder / decode).
+The encoder runs as a compiled MAX graph. The decoder (LSTM prediction
+network + joint network + greedy decode loop) also runs as compiled MAX
+graphs — a projection graph and a decoder step graph, both loaded into
+the same InferenceSession. Encoder output stays as a Buffer on-device,
+eliminating any device transfer overhead.
 """
 
 from __future__ import annotations
@@ -50,33 +48,13 @@ from transformers import AutoConfig
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
 from ..parakeet.encoder import ParakeetEncoder
-
-# Always import numpy CPU fallback.
-from .decode import tdt_greedy_decode
-from .decoder import JointNetwork, PredictionNetwork
+from .decoder_graph import (
+    TDTGraphDecoder,
+    build_decoder_step_graph,
+    build_projection_graph,
+    convert_decoder_state_dict,
+)
 from .model_config import TDTModelConfig
-
-# Prefer PyTorch GPU decoder when available.
-_USE_TORCH_DECODER = False
-try:
-    import torch
-
-    if torch.cuda.is_available():
-        from .decode_torch import (
-            tdt_greedy_decode as tdt_greedy_decode_torch,
-        )
-        from .decoder_torch import (
-            JointNetwork as JointNetworkTorch,
-        )
-        from .decoder_torch import (
-            PredictionNetwork as PredictionNetworkTorch,
-        )
-
-        _USE_TORCH_DECODER = True
-    else:
-        print("PyTorch available but CUDA not detected, using numpy decoder")
-except ImportError as e:
-    print(f"PyTorch GPU decoder not available: {e}")
 
 NDFloat = npt.NDArray[np.floating]
 
@@ -121,9 +99,13 @@ def build_graph(
 class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
     """Pipeline model for Parakeet-TDT ASR inference.
 
-    Runs the FastConformer encoder in a compiled graph, then performs
-    TDT greedy decoding in Python/numpy using the LSTM prediction network
-    and joint network.
+    Loads three compiled MAX graphs into a single InferenceSession:
+    1. Encoder graph — FastConformer, mel → encoder hidden states
+    2. Projection graph — pre-projects encoder output (1024→640) once
+    3. Decoder step graph — one LSTM + joint step, called in a loop
+
+    All graphs run on the same device (CPU or GPU). Encoder output flows
+    between graphs as Buffers with no host transfer.
     """
 
     def __init__(
@@ -147,39 +129,57 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         )
         self.tdt_config = TDTModelConfig.initialize(self.pipeline_config)
         self.model = self.load_model(session)
-        self._load_decoder_weights()
+        self._load_decoder(session)
 
-    def _load_decoder_weights(self) -> None:
-        """Load LSTM prediction network and joint network from npz file.
+    def _load_decoder(self, session: InferenceSession) -> None:
+        """Load decoder weights and compile projection + step graphs.
 
-        When PyTorch+CUDA is available, weights are placed on GPU as torch
-        tensors for GPU-accelerated decoding. Otherwise falls back to numpy.
+        Builds two MAX graphs that run on the same device as the encoder:
+        1. Projection graph — pre-projects encoder output (1024→640) once
+        2. Decoder step graph — one LSTM + joint step, called in a loop
         """
         npz_path = huggingface_hub.hf_hub_download(
             self.pipeline_config.model.model_path, "decoder_joint.npz"
         )
-        weights = dict(np.load(npz_path))
+        npz_weights = dict(np.load(npz_path))
+        proj_dict, pred_dict, joint_dict = convert_decoder_state_dict(
+            npz_weights
+        )
 
-        if _USE_TORCH_DECODER:
-            self.prediction_net = PredictionNetworkTorch.from_npz(weights)
-            self.joint_net = JointNetworkTorch.from_npz(weights)
-            self._use_torch_decoder = True
-            logger.info(
-                "Loaded TDT decoder (PyTorch GPU): %d LSTM layers, "
-                "pred_hidden=%d",
-                self.prediction_net.num_layers,
-                self.prediction_net.pred_hidden,
-            )
-        else:
-            self.prediction_net = PredictionNetwork.from_npz(weights)
-            self.joint_net = JointNetwork.from_npz(weights)
-            self._use_torch_decoder = False
-            logger.info(
-                "Loaded TDT decoder (numpy CPU): %d LSTM layers, "
-                "pred_hidden=%d",
-                self.prediction_net.num_layers,
-                self.prediction_net.pred_hidden,
-            )
+        timer = CompilationTimer("TDT-Projection")
+        proj_graph = build_projection_graph(self.tdt_config, proj_dict)
+        timer.mark_build_complete()
+        projection_model = session.load(proj_graph, weights_registry=proj_dict)
+        timer.done()
+
+        timer = CompilationTimer("TDT-DecoderStep")
+        dec_graph = build_decoder_step_graph(
+            self.tdt_config, pred_dict, joint_dict
+        )
+        timer.mark_build_complete()
+        # Merge prediction + joint dicts for the weights_registry
+        dec_weights = {**pred_dict, **joint_dict}
+        decoder_step_model = session.load(
+            dec_graph, weights_registry=dec_weights
+        )
+        timer.done()
+
+        from max.driver import DeviceSpec, load_devices
+
+        cpu_device = load_devices([DeviceSpec.cpu()])[0]
+
+        self.graph_decoder = TDTGraphDecoder(
+            projection_model=projection_model,
+            decoder_step_model=decoder_step_model,
+            config=self.tdt_config,
+            device=self.devices[0],
+            cpu_device=cpu_device,
+        )
+        logger.info(
+            "Loaded TDT decoder (MAX graph, device=%s): "
+            "projection + step graphs compiled",
+            self.tdt_config.device,
+        )
 
     @classmethod
     def calculate_max_seq_len(
@@ -201,44 +201,13 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
     def decode(self, model_inputs: ModelInputs) -> list[list[int]]:
         """Run encoder + TDT greedy decode, returning token ID sequences.
 
-        This is the full TDT inference path: encoder graph produces hidden
-        states, then the LSTM prediction network + joint network + TDT greedy
-        decode loop produces token IDs.
-
-        When PyTorch+CUDA is available, the encoder output stays on GPU as a
-        torch tensor (via ``torch.from_dlpack``), and decoding runs entirely
-        on GPU with pre-projected encoder/decoder outputs. This eliminates
-        the ~47ms GPU→CPU transfer and runs the decode loop ~10-30x faster
-        than the numpy CPU path.
-
-        Falls back to numpy CPU decoding otherwise.
+        Encoder output stays as a Buffer on-device. The projection graph
+        pre-projects it once, then the decoder step graph runs in a Python
+        loop with LSTM states flowing as Buffers between iterations.
         """
         outputs = self.execute(model_inputs)
         assert outputs.logits is not None
-
-        if self._use_torch_decoder:
-            # Keep encoder output on GPU — no copy to CPU.
-            encoder_output = torch.from_dlpack(outputs.logits)
-            if encoder_output.dim() == 2:
-                encoder_output = encoder_output.unsqueeze(0)
-            return tdt_greedy_decode_torch(
-                encoder_output=encoder_output,
-                prediction_net=self.prediction_net,
-                joint_net=self.joint_net,
-                durations=self.tdt_config.tdt_durations,
-                vocab_size=self.tdt_config.vocab_size,
-                blank_id=self.tdt_config.blank_id,
-            )
-        else:
-            encoder_output = np.from_dlpack(outputs.logits).copy()
-            return tdt_greedy_decode(
-                encoder_output=encoder_output,
-                prediction_net=self.prediction_net,
-                joint_net=self.joint_net,
-                durations=self.tdt_config.tdt_durations,
-                vocab_size=self.tdt_config.vocab_size,
-                blank_id=self.tdt_config.blank_id,
-            )
+        return self.graph_decoder.decode(outputs.logits)
 
     def prepare_mel_input(self, features: NDFloat) -> ParakeetTDTInputs:
         """Prepare mel features for model execution.
