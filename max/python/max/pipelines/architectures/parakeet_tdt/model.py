@@ -36,7 +36,7 @@ from max.graph.weights import WeightData, Weights, WeightsAdapter
 from max.nn import Linear
 from max.nn.kv_cache import KVCacheInputs
 from max.nn.transformer import ReturnLogits
-from max.pipelines.core import TextContext
+from max.pipelines.core import ASRContext
 from max.pipelines.lib import (
     CompilationTimer,
     KVCacheConfig,
@@ -110,7 +110,7 @@ def build_graph(
     return graph
 
 
-class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
+class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
     """Pipeline model for Parakeet-TDT ASR inference.
 
     Loads three compiled MAX graphs into a single InferenceSession:
@@ -280,7 +280,7 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
 
     def prepare_initial_token_inputs(
         self,
-        replica_batches: Sequence[Sequence[TextContext]],
+        replica_batches: Sequence[Sequence[ASRContext]],
         kv_cache_inputs: KVCacheInputs | None = None,
         return_n_logits: int = 1,
     ) -> ParakeetTDTInputs:

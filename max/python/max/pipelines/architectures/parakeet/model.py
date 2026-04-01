@@ -28,7 +28,7 @@ from max.engine import InferenceSession, Model
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn.kv_cache import KVCacheInputs
 from max.nn.transformer import ReturnLogits
-from max.pipelines.core import TextContext
+from max.pipelines.core import ASRContext
 from max.pipelines.lib import (
     CompilationTimer,
     KVCacheConfig,
@@ -55,7 +55,7 @@ class ParakeetInputs(ModelInputs):
     input_features: Buffer  # (batch, num_frames, num_mel_bins)
 
 
-class ParakeetPipelineModel(PipelineModel[TextContext]):
+class ParakeetPipelineModel(PipelineModel[ASRContext]):
     """Pipeline model for Parakeet-CTC ASR inference."""
 
     def __init__(
@@ -144,7 +144,7 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
 
     def prepare_initial_token_inputs(
         self,
-        replica_batches: Sequence[Sequence[TextContext]],
+        replica_batches: Sequence[Sequence[ASRContext]],
         kv_cache_inputs: KVCacheInputs | None = None,
         return_n_logits: int = 1,
     ) -> ParakeetInputs:
