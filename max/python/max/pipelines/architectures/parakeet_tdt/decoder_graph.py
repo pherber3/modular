@@ -510,6 +510,20 @@ class TDTGraphDecoder:
         self.pred_hidden = config.pred_hidden
         self.joint_hidden = config.joint_hidden
 
+        # Pre-allocate time index buffers for all 400 possible timesteps.
+        # Eliminates Buffer.from_numpy().to(device) per step (~0.15ms each).
+        max_t = 400
+        self._t_index_bufs = [
+            Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
+            for t in range(max_t)
+        ]
+
+        # Pre-allocate token buffer on GPU + CPU staging buffer.
+        # Use inplace_copy_from to update the GPU buffer each step
+        # instead of creating a new Buffer.
+        self._token_cpu = np.array([[config.blank_id]], dtype=np.int32)
+        self._token_gpu = Buffer.from_numpy(self._token_cpu.copy()).to(device)
+
     def decode(self, encoder_output: Buffer) -> list[list[int]]:
         """Run full TDT decode: projection + greedy loop.
 
@@ -533,23 +547,20 @@ class TDTGraphDecoder:
         h1 = Buffer.from_numpy(zero_state).to(self.device)
         c1 = Buffer.from_numpy(zero_state).to(self.device)
 
-        # Initial token: blank (SOS)
-        token_buf = Buffer.from_numpy(
-            np.array([[self.blank_id]], dtype=np.int32)
-        ).to(self.device)
+        # Initial token: blank (SOS) — use pre-allocated GPU buffer.
+        self._token_cpu[0, 0] = self.blank_id
+        token_buf = self._token_gpu
+        token_buf.inplace_copy_from(Buffer.from_numpy(self._token_cpu))
 
         # Run initial prediction step to get SOS state.
-        t_index_buf = Buffer.from_numpy(np.array([0], dtype=np.int32)).to(
-            self.device
-        )
         outputs = self.decoder_step_model.execute(
-            token_buf, h0, c0, h1, c1, projected_buf, t_index_buf
+            token_buf, h0, c0, h1, c1, projected_buf, self._t_index_bufs[0]
         )
         _, _, h0, c0, h1, c1 = outputs
 
         # Step 3: Greedy decode loop.
-        # Per step: t_index upload (4 bytes) + token/dur_idx readback (8 bytes).
-        # All state Buffers and projected_buf stay on device throughout.
+        # Per step: pre-allocated t_index lookup + readback (8 bytes).
+        # No Buffer.from_numpy().to(device) in the hot loop.
         tokens: list[int] = []
         t = 0
         max_symbols_per_step = 10
@@ -558,21 +569,18 @@ class TDTGraphDecoder:
             symbols_at_t = 0
 
             while symbols_at_t < max_symbols_per_step:
-                # Upload timestep index (4 bytes)
-                t_index_buf = Buffer.from_numpy(
-                    np.array([t], dtype=np.int32)
-                ).to(self.device)
-
-                # Execute decoder step — all on device.
-                # Argmax is done inside the graph; only two int32 scalars
-                # are returned (best_token, best_dur_idx).
                 outputs = self.decoder_step_model.execute(
-                    token_buf, h0, c0, h1, c1, projected_buf, t_index_buf
+                    token_buf,
+                    h0,
+                    c0,
+                    h1,
+                    c1,
+                    projected_buf,
+                    self._t_index_bufs[t],
                 )
                 token_buf_out, dur_idx_buf, h0, c0, h1, c1 = outputs
 
                 # Read back greedy decisions (8 bytes total).
-                # .to(cpu) is a no-op when already on CPU.
                 token = int(
                     np.from_dlpack(token_buf_out.to(self.cpu_device))[0]
                 )
@@ -585,12 +593,10 @@ class TDTGraphDecoder:
                     t += max(duration, 1)
                     break
 
-                # Non-blank: emit token. The graph already output the
-                # token as int32 — reshape it for next step's input.
+                # Non-blank: emit token, update GPU token buffer in-place.
                 tokens.append(token)
-                token_buf = Buffer.from_numpy(
-                    np.array([[token]], dtype=np.int32)
-                ).to(self.device)
+                self._token_cpu[0, 0] = token
+                token_buf.inplace_copy_from(Buffer.from_numpy(self._token_cpu))
                 symbols_at_t += 1
 
                 if duration > 0:
