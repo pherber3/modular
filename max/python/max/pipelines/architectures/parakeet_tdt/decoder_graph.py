@@ -516,54 +516,142 @@ class TDTGraphDecoder:
 
         # Pre-allocate ALL small buffers at init. This eliminates every
         # Buffer.from_numpy().to(device) call from the decode hot loop.
-        # Total: 400 t_index bufs (1.6KB) + 1025 token bufs (4KB) = ~6KB.
-
         max_t = 400
         self._t_index_bufs = [
             Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
             for t in range(max_t)
         ]
 
-        # Pre-allocate token buffers for all possible token IDs (0..vocab_size).
-        # Blank ID = vocab_size, so this covers everything including SOS.
-        num_tokens = config.vocab_size + 1  # vocab + blank
+        num_tokens = config.vocab_size + 1
         self._token_bufs = [
             Buffer.from_numpy(np.array([[tid]], dtype=np.int32)).to(device)
             for tid in range(num_tokens)
         ]
 
+        # Persistent input buffers for CUDA graph capture/replay.
+        # These stay allocated across the entire decode and are updated
+        # via inplace_copy_from between replay calls.
+        zero = np.zeros((1, config.pred_hidden), dtype=np.float32)
+        self._h0_buf = Buffer.from_numpy(zero.copy()).to(device)
+        self._c0_buf = Buffer.from_numpy(zero.copy()).to(device)
+        self._h1_buf = Buffer.from_numpy(zero.copy()).to(device)
+        self._c1_buf = Buffer.from_numpy(zero.copy()).to(device)
+        self._token_input_buf = Buffer.from_numpy(
+            np.array([[config.blank_id]], dtype=np.int32)
+        ).to(device)
+        self._t_input_buf = Buffer.from_numpy(np.array([0], dtype=np.int32)).to(
+            device
+        )
+
+        # Persistent enc_projected buffer for CUDA graph capture.
+        # Allocated on first decode() call since shape depends on encoder.
+        self._enc_proj_buf: Buffer | None = None
+        self._captured = False
+        self._graph_key = 1
+        self._captured_outputs: list[Buffer] = []
+
+    def _capture_graph(self, enc_projected: Buffer) -> None:
+        """Capture the decoder step as a CUDA graph for fast replay.
+
+        Called once on the first decode(). Subsequent calls use replay().
+        The enc_projected buffer is copied into a persistent buffer so
+        the CUDA graph always references the same memory addresses.
+        """
+        # Allocate persistent enc_projected buffer matching shape.
+        self._enc_proj_buf = enc_projected.copy()
+        self._enc_proj_buf.inplace_copy_from(enc_projected)
+
+        # Set initial state for capture.
+        zero = Buffer.from_numpy(
+            np.zeros((1, self.pred_hidden), dtype=np.float32)
+        ).to(self.device)
+        self._h0_buf.inplace_copy_from(zero)
+        self._c0_buf.inplace_copy_from(zero)
+        self._h1_buf.inplace_copy_from(zero)
+        self._c1_buf.inplace_copy_from(zero)
+        self._token_input_buf.inplace_copy_from(self._token_bufs[self.blank_id])
+        self._t_input_buf.inplace_copy_from(self._t_index_bufs[0])
+
+        self._captured_outputs = list(
+            self.decoder_step_model.capture(
+                self._graph_key,
+                self._token_input_buf,
+                self._h0_buf,
+                self._c0_buf,
+                self._h1_buf,
+                self._c1_buf,
+                self._enc_proj_buf,
+                self._t_input_buf,
+            )
+        )
+        self._captured = True
+        logger.info(
+            "Captured decoder step CUDA graph (key=%d)", self._graph_key
+        )
+
+    def _replay_step(self) -> None:
+        """Replay the captured CUDA graph with current input buffer values."""
+        self.decoder_step_model.replay(
+            self._graph_key,
+            self._token_input_buf,
+            self._h0_buf,
+            self._c0_buf,
+            self._h1_buf,
+            self._c1_buf,
+            self._enc_proj_buf,
+            self._t_input_buf,
+        )
+
     def decode(self, enc_projected: Buffer) -> list[list[int]]:
         """Run TDT greedy decode on pre-projected encoder output.
 
+        Uses CUDA graph capture/replay to minimize per-step dispatch
+        overhead. The graph is captured on the first call and replayed
+        on subsequent steps. Input values are updated via inplace_copy_from
+        between replays.
+
         Args:
             enc_projected: Pre-projected encoder output on GPU,
-                shape ``(1, T, joint_hidden)``. Already includes the
-                joint.enc projection from the fused encoder graph.
+                shape ``(1, T, joint_hidden)``.
 
         Returns:
             List of token ID sequences (one per batch element).
         """
-        T = 400  # Fixed from encoder's 3200 frames / 8x subsampling
+        T = 400
 
-        # Initialize LSTM states as zero Buffers on device.
-        zero_state = np.zeros((1, self.pred_hidden), dtype=np.float32)
-        h0 = Buffer.from_numpy(zero_state).to(self.device)
-        c0 = Buffer.from_numpy(zero_state).to(self.device)
-        h1 = Buffer.from_numpy(zero_state).to(self.device)
-        c1 = Buffer.from_numpy(zero_state).to(self.device)
+        # Reset LSTM states to zero.
+        zero = Buffer.from_numpy(
+            np.zeros((1, self.pred_hidden), dtype=np.float32)
+        ).to(self.device)
+        self._h0_buf.inplace_copy_from(zero)
+        self._c0_buf.inplace_copy_from(zero)
+        self._h1_buf.inplace_copy_from(zero)
+        self._c1_buf.inplace_copy_from(zero)
 
-        # Initial token: blank (SOS) — pre-allocated GPU buffer.
-        token_buf = self._token_bufs[self.blank_id]
+        # Capture on first call, reuse on subsequent calls.
+        if not self._captured:
+            self._capture_graph(enc_projected)
+        else:
+            assert self._enc_proj_buf is not None
+            self._enc_proj_buf.inplace_copy_from(enc_projected)
 
-        # Run initial prediction step to get SOS state.
-        outputs = self.decoder_step_model.execute(
-            token_buf, h0, c0, h1, c1, enc_projected, self._t_index_bufs[0]
-        )
-        _, h0, c0, h1, c1 = outputs
+        # SOS step: run with blank token at t=0.
+        self._token_input_buf.inplace_copy_from(self._token_bufs[self.blank_id])
+        self._t_input_buf.inplace_copy_from(self._t_index_bufs[0])
+        self._replay_step()
 
-        # Greedy decode loop.
-        # Zero allocations in the hot loop: all buffers are pre-allocated
-        # index lookups. One batched GPU→CPU readback (8 bytes) per step.
+        # Copy output states back to input state buffers for next step.
+        decisions_out = self._captured_outputs[0]
+        h0_out = self._captured_outputs[1]
+        c0_out = self._captured_outputs[2]
+        h1_out = self._captured_outputs[3]
+        c1_out = self._captured_outputs[4]
+        self._h0_buf.inplace_copy_from(h0_out)
+        self._c0_buf.inplace_copy_from(c0_out)
+        self._h1_buf.inplace_copy_from(h1_out)
+        self._c1_buf.inplace_copy_from(c1_out)
+
+        # Greedy decode loop with CUDA graph replay.
         tokens: list[int] = []
         t = 0
         max_symbols_per_step = 10
@@ -572,20 +660,21 @@ class TDTGraphDecoder:
             symbols_at_t = 0
 
             while symbols_at_t < max_symbols_per_step:
-                outputs = self.decoder_step_model.execute(
-                    token_buf,
-                    h0,
-                    c0,
-                    h1,
-                    c1,
-                    enc_projected,
-                    self._t_index_bufs[t],
-                )
-                decisions_buf, h0, c0, h1, c1 = outputs
+                # Update time index input.
+                self._t_input_buf.inplace_copy_from(self._t_index_bufs[t])
 
-                # Single GPU→CPU readback: 8 bytes total.
+                # Replay captured graph (near-zero dispatch overhead).
+                self._replay_step()
+
+                # Copy LSTM output states back to input buffers.
+                self._h0_buf.inplace_copy_from(h0_out)
+                self._c0_buf.inplace_copy_from(c0_out)
+                self._h1_buf.inplace_copy_from(h1_out)
+                self._c1_buf.inplace_copy_from(c1_out)
+
+                # Single GPU→CPU readback: 8 bytes.
                 decisions = np.from_dlpack(
-                    decisions_buf.to(self.cpu_device)
+                    decisions_out.to(self.cpu_device)
                 ).flatten()
                 token = int(decisions[0])
                 dur_idx = int(decisions[1])
@@ -595,17 +684,15 @@ class TDTGraphDecoder:
                     t += max(duration, 1)
                     break
 
-                # Non-blank: emit token, swap to pre-allocated buffer.
+                # Non-blank: update token input buffer in-place.
                 tokens.append(token)
-                token_buf = self._token_bufs[token]
+                self._token_input_buf.inplace_copy_from(self._token_bufs[token])
                 symbols_at_t += 1
 
                 if duration > 0:
                     t += duration
                     break
-                # duration == 0: stay at same t (multiple emissions)
             else:
-                # Safety: hit max_symbols_per_step, force advance
                 t += 1
 
         return [tokens]
