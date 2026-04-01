@@ -35,7 +35,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import numpy.typing as npt
-from max.driver import Buffer, Device, DevicePinnedBuffer
+from max.driver import Buffer, Device
 from max.dtype import DType
 from max.engine import Model
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
@@ -385,7 +385,7 @@ def build_decoder_step_graph(
 
         # Split logits into token and duration, argmax on-device.
         # This avoids transferring the full 1030-element logits vector
-        # back to CPU each step — only two int32 scalars are returned.
+        # back to CPU each step.
         num_token_classes = vocab_size + 1
         token_logits, dur_logits = ops.split(
             logits, [num_token_classes, num_durations], axis=-1
@@ -397,10 +397,14 @@ def build_decoder_step_graph(
         best_token = ops.cast(best_token, DType.int32)
         best_dur_idx = ops.cast(best_dur_idx, DType.int32)
 
-        # 7 outputs: best_token, best_dur_idx, h0', c0', h1', c1', pred_out
-        # pred_out is returned so we can feed it back for the next token
-        # when a non-blank is emitted (need to update token_id input).
-        graph.output(best_token, best_dur_idx, h0_new, c0_new, h1_new, c1_new)
+        # Stack into single (2,) tensor — one GPU→CPU transfer per step
+        # instead of two separate .to(cpu) calls.
+        decisions = ops.concat(
+            [ops.unsqueeze(best_token, 0), ops.unsqueeze(best_dur_idx, 0)],
+            axis=-1,
+        )  # (1, 2) int32
+
+        graph.output(decisions, h0_new, c0_new, h1_new, c1_new)
 
     return graph
 
@@ -510,24 +514,23 @@ class TDTGraphDecoder:
         self.pred_hidden = config.pred_hidden
         self.joint_hidden = config.joint_hidden
 
-        # Pre-allocate time index buffers for all 400 possible timesteps.
+        # Pre-allocate ALL small buffers at init. This eliminates every
+        # Buffer.from_numpy().to(device) call from the decode hot loop.
+        # Total: 400 t_index bufs (1.6KB) + 1025 token bufs (4KB) = ~6KB.
+
         max_t = 400
         self._t_index_bufs = [
             Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
             for t in range(max_t)
         ]
 
-        # Pre-allocate token buffer using pinned memory for fast transfers.
-        # DevicePinnedBuffer gives a numpy-writable host buffer with fast
-        # GPU copy via inplace_copy_from.
-        self._token_pinned = DevicePinnedBuffer(
-            dtype=DType.int32, shape=(1, 1), device=device
-        )
-        self._token_np = self._token_pinned.to_numpy()
-        self._token_np[0, 0] = config.blank_id
-        self._token_gpu = Buffer.from_numpy(
-            np.array([[config.blank_id]], dtype=np.int32)
-        ).to(device)
+        # Pre-allocate token buffers for all possible token IDs (0..vocab_size).
+        # Blank ID = vocab_size, so this covers everything including SOS.
+        num_tokens = config.vocab_size + 1  # vocab + blank
+        self._token_bufs = [
+            Buffer.from_numpy(np.array([[tid]], dtype=np.int32)).to(device)
+            for tid in range(num_tokens)
+        ]
 
     def decode(self, enc_projected: Buffer) -> list[list[int]]:
         """Run TDT greedy decode on pre-projected encoder output.
@@ -549,20 +552,18 @@ class TDTGraphDecoder:
         h1 = Buffer.from_numpy(zero_state).to(self.device)
         c1 = Buffer.from_numpy(zero_state).to(self.device)
 
-        # Reset token buffer to blank (SOS) via pinned memory.
-        self._token_np[0, 0] = self.blank_id
-        token_buf = self._token_gpu
-        token_buf.inplace_copy_from(self._token_pinned)
+        # Initial token: blank (SOS) — pre-allocated GPU buffer.
+        token_buf = self._token_bufs[self.blank_id]
 
         # Run initial prediction step to get SOS state.
         outputs = self.decoder_step_model.execute(
             token_buf, h0, c0, h1, c1, enc_projected, self._t_index_bufs[0]
         )
-        _, _, h0, c0, h1, c1 = outputs
+        _, h0, c0, h1, c1 = outputs
 
         # Greedy decode loop.
-        # Per step: pre-allocated t_index lookup + pinned token update +
-        # readback (8 bytes). No Buffer allocation in the hot loop.
+        # Zero allocations in the hot loop: all buffers are pre-allocated
+        # index lookups. One batched GPU→CPU readback (8 bytes) per step.
         tokens: list[int] = []
         t = 0
         max_symbols_per_step = 10
@@ -580,26 +581,23 @@ class TDTGraphDecoder:
                     enc_projected,
                     self._t_index_bufs[t],
                 )
-                token_buf_out, dur_idx_buf, h0, c0, h1, c1 = outputs
+                decisions_buf, h0, c0, h1, c1 = outputs
 
-                # Read back greedy decisions (8 bytes total).
-                token = int(
-                    np.from_dlpack(token_buf_out.to(self.cpu_device))[0]
-                )
-                dur_idx = int(
-                    np.from_dlpack(dur_idx_buf.to(self.cpu_device))[0]
-                )
+                # Single GPU→CPU readback: 8 bytes total.
+                decisions = np.from_dlpack(
+                    decisions_buf.to(self.cpu_device)
+                ).flatten()
+                token = int(decisions[0])
+                dur_idx = int(decisions[1])
                 duration = self.durations[dur_idx]
 
                 if token == self.blank_id:
                     t += max(duration, 1)
                     break
 
-                # Non-blank: emit token, update GPU token buffer via
-                # pinned memory (write to numpy view, copy pinned→GPU).
+                # Non-blank: emit token, swap to pre-allocated buffer.
                 tokens.append(token)
-                self._token_np[0, 0] = token
-                token_buf.inplace_copy_from(self._token_pinned)
+                token_buf = self._token_bufs[token]
                 symbols_at_t += 1
 
                 if duration > 0:
