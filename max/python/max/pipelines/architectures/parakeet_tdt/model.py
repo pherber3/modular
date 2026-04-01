@@ -89,7 +89,7 @@ def build_graph(
 
     with Graph("parakeet_tdt_encoder", input_types=[input_type]) as graph:
         encoder = ParakeetEncoder(config)
-        encoder.load_state_dict(state_dict)
+        encoder.load_state_dict(state_dict, strict=False)
         input_features = graph.inputs[0].tensor
         hidden_states = encoder(input_features)
 
@@ -101,7 +101,7 @@ def build_graph(
             has_bias=True,
             name="enc_proj",
         )
-        enc_proj.load_state_dict(state_dict)
+        enc_proj.load_state_dict(state_dict, strict=False)
         enc_projected = enc_proj(hidden_states)
 
         graph.output(enc_projected)
