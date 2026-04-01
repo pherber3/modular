@@ -19,6 +19,7 @@ No torch, librosa, or soundfile dependencies.
 
 from __future__ import annotations
 
+import functools
 import io
 import wave
 
@@ -48,6 +49,7 @@ def read_wav(audio_bytes: bytes) -> tuple[NDFloat, int]:
     return audio, sample_rate
 
 
+@functools.lru_cache(maxsize=4)
 def _mel_filterbank(sr: int, n_fft: int, n_mels: int) -> NDFloat:
     """Compute a slaney-normalized mel filterbank matrix.
 
@@ -135,11 +137,16 @@ def extract_mel(
     padded_window[offset : offset + win_length] = window
 
     n_frames = 1 + (len(audio_padded) - n_fft) // hop_length
-    stft = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex64)
-    for i in range(n_frames):
-        start = i * hop_length
-        frame = audio_padded[start : start + n_fft]
-        stft[:, i] = np.fft.rfft(frame * padded_window)
+
+    # Vectorized STFT: use stride_tricks to create a (n_frames, n_fft)
+    # view without copying, then batch-FFT all frames at once.
+    stride = audio_padded.strides[0]
+    frames = np.lib.stride_tricks.as_strided(
+        audio_padded,
+        shape=(n_frames, n_fft),
+        strides=(stride * hop_length, stride),
+    )
+    stft = np.fft.rfft(frames * padded_window, axis=1).T
 
     power = np.abs(stft) ** 2
     mel_basis = _mel_filterbank(sr, n_fft, n_mels)

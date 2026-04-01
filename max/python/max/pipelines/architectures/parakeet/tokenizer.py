@@ -10,11 +10,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Tokenizer for Parakeet-CTC models.
+"""Tokenizer for Parakeet ASR models.
 
-Parakeet is an ASR model that takes audio input, not text. This tokenizer
-provides the CTC vocabulary mapping for decoding model outputs (token IDs
-back to text). The blank token (CTC) is at index vocab_size - 1 = 1024.
+Parakeet models take audio input, not text. These tokenizers provide the
+vocabulary mapping for decoding model outputs (token IDs back to text).
+The shared ``_BaseParakeetTokenizer`` handles audio context creation;
+subclasses override ``eos`` for their blank token convention.
 """
 
 from __future__ import annotations
@@ -24,22 +25,11 @@ from max.pipelines.core import ASRContext
 from max.pipelines.lib import TextTokenizer
 
 
-class ParakeetTokenizer(TextTokenizer):
-    @property
-    def eos(self) -> int:
-        if self.delegate.eos_token_id is not None:
-            return self.delegate.eos_token_id
-        if self.delegate.pad_token_id is not None:
-            return self.delegate.pad_token_id
-        return 1024
+class _BaseParakeetTokenizer(TextTokenizer):
+    """Shared base for Parakeet CTC and TDT tokenizers."""
 
-    async def new_context(
-        self, request: TextGenerationRequest
-    ) -> ASRContext:
-        """Create an ASR context carrying audio bytes from the request.
-
-        The route passes raw audio bytes via ``request.prompt``.
-        """
+    async def new_context(self, request: TextGenerationRequest) -> ASRContext:
+        """Create an ASR context carrying audio bytes from the request."""
         audio_data = request.prompt
         if not isinstance(audio_data, bytes):
             raise TypeError(
@@ -50,3 +40,15 @@ class ParakeetTokenizer(TextTokenizer):
             audio_data=audio_data,
             model_name=request.model_name,
         )
+
+
+class ParakeetTokenizer(_BaseParakeetTokenizer):
+    """Tokenizer for Parakeet-CTC. Blank token at vocab_size - 1 (1024)."""
+
+    @property
+    def eos(self) -> int:
+        if self.delegate.eos_token_id is not None:
+            return self.delegate.eos_token_id
+        if self.delegate.pad_token_id is not None:
+            return self.delegate.pad_token_id
+        return 1024

@@ -31,15 +31,75 @@ from .model_config import ParakeetModelConfig
 from .positional import rel_shift
 
 # ---------------------------------------------------------------------------
-# Weight container (for holding named weights without ops.conv2d)
+# Depthwise Conv1D (manual implementation, avoids grouped conv2d bugs)
 # ---------------------------------------------------------------------------
 
 
-class _WeightContainer(Module):
-    """Minimal Module subclass that holds weights for load_state_dict."""
+class DepthwiseConv1D(Module):
+    """Depthwise 1D convolution via slice+multiply+sum.
+
+    Avoids ``ops.conv2d`` with ``groups=channels`` which has GPU
+    compilation bugs. The forward pass manually slides the kernel
+    over the sequence dimension.
+
+    Weights are stored in SCF format ``(kernel_size, 1, channels)``
+    to match the converted weight layout from the adapter.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+        dtype: DType,
+        device: DeviceRef,
+        has_bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size - 1) // 2
+        self.weight = Weight(
+            name="weight",
+            dtype=dtype,
+            shape=[kernel_size, 1, channels],
+            device=device,
+        )
+        self.bias: Weight | None = None
+        if has_bias:
+            self.bias = Weight(
+                name="bias", dtype=dtype, shape=[channels], device=device
+            )
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        raise NotImplementedError("_WeightContainer is not callable")
+        """Apply depthwise conv to ``(batch, seq_len, channels)`` input."""
+        x = ops.pad(x, [0, 0, self.padding, self.padding, 0, 0])
+        dw = ops.reshape(self.weight, [self.kernel_size, -1])
+        result = (
+            ops.slice_tensor(
+                x,
+                [
+                    slice(None),
+                    slice(0, x.shape[1] - self.kernel_size + 1),
+                    slice(None),
+                ],
+            )
+            * dw[0]
+        )
+        for k in range(1, self.kernel_size):
+            result = (
+                result
+                + ops.slice_tensor(
+                    x,
+                    [
+                        slice(None),
+                        slice(k, x.shape[1] - self.kernel_size + 1 + k),
+                        slice(None),
+                    ],
+                )
+                * dw[k]
+            )
+        if self.bias is not None:
+            result = result + self.bias
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -138,14 +198,8 @@ class ParakeetConvModule(Module):
     def __init__(self, config: ParakeetModelConfig) -> None:
         super().__init__()
         channels = config.hidden_size
-        self.kernel_size = config.conv_kernel_size
-        self.padding = (self.kernel_size - 1) // 2
-
         conv_bias = config.convolution_bias
 
-        # Use Linear instead of Conv1D for pointwise (kernel_size=1) to
-        # avoid ops.conv2d which has GPU compilation issues with symbolic
-        # shapes derived from conv subsampling.
         self.pointwise_conv1 = Linear(
             channels,
             2 * channels,
@@ -153,26 +207,13 @@ class ParakeetConvModule(Module):
             config.device,
             has_bias=conv_bias,
         )
-        # Depthwise conv weights: (kernel_size, 1, channels) in SCF format.
-        # Implemented manually via slice+multiply+sum to avoid ops.conv2d
-        # grouped conv compilation bugs on GPU.
-        # Use a _WeightContainer to hold depthwise weights so that
-        # load_state_dict finds them at "conv.depthwise_conv.weight".
-        self.depthwise_conv = _WeightContainer()
-        self.depthwise_conv.weight = Weight(
-            name="weight",
+        self.depthwise_conv = DepthwiseConv1D(
+            channels=channels,
+            kernel_size=self.kernel_size,
             dtype=config.dtype,
-            shape=[self.kernel_size, 1, channels],
             device=config.device,
+            has_bias=conv_bias,
         )
-        self.depthwise_conv.bias = None
-        if conv_bias:
-            self.depthwise_conv.bias = Weight(
-                name="bias",
-                dtype=config.dtype,
-                shape=[channels],
-                device=config.device,
-            )
         self.norm = BatchNorm1d(
             channels, dtype=config.dtype, device=config.device
         )
@@ -192,40 +233,7 @@ class ParakeetConvModule(Module):
         x_a, x_b = ops.split(x, [half, half], axis=2)
         x = x_a * ops.sigmoid(x_b)  # (batch, seq_len, channels)
 
-        # Manual depthwise conv: pad, then slice+multiply+sum over kernel.
-        # x is (batch, seq_len, channels). Pad on the seq_len dim.
-        x = ops.pad(x, [0, 0, self.padding, self.padding, 0, 0])
-        # depthwise_weight is (kernel_size, 1, channels) — squeeze to
-        # (kernel_size, channels) for broadcasting.
-        dw = ops.reshape(self.depthwise_conv.weight, [self.kernel_size, -1])
-        # Sum over kernel positions: each slice is (batch, seq_len, channels)
-        result = (
-            ops.slice_tensor(
-                x,
-                [
-                    slice(None),
-                    slice(0, x.shape[1] - self.kernel_size + 1),
-                    slice(None),
-                ],
-            )
-            * dw[0]
-        )
-        for k in range(1, self.kernel_size):
-            result = (
-                result
-                + ops.slice_tensor(
-                    x,
-                    [
-                        slice(None),
-                        slice(k, x.shape[1] - self.kernel_size + 1 + k),
-                        slice(None),
-                    ],
-                )
-                * dw[k]
-            )
-        x = result
-        if self.depthwise_conv.bias is not None:
-            x = x + self.depthwise_conv.bias
+        x = self.depthwise_conv(x)
 
         # BatchNorm expects (batch, channels, length)
         x = self.norm(x.transpose(1, 2)).transpose(1, 2)
@@ -361,18 +369,7 @@ class ParakeetAttention(Module):
         matrix_bd = matrix_bd * self.scaling
 
         attn_weights = matrix_ac + matrix_bd
-        # Manual softmax + matmul to avoid flash attention fusion.
-        # The GPU compiler's flash attention kernel crashes with
-        # CUDA_ERROR_MISALIGNED_ADDRESS on conformer-style relative
-        # positional attention.
-        # Manual softmax to avoid flash attention fusion.
-        attn_max = ops.max(attn_weights, axis=-1)
-        # ops.max may keep dims; reshape to ensure [B, H, S, 1]
-        attn_max = ops.reshape(attn_max, [batch, self.num_heads, -1, 1])
-        attn_weights = ops.exp(attn_weights - attn_max)
-        attn_sum = ops.sum(attn_weights, axis=-1)
-        attn_sum = ops.reshape(attn_sum, [batch, self.num_heads, -1, 1])
-        attn_weights = attn_weights / attn_sum
+        attn_weights = ops.softmax(attn_weights, axis=-1)
 
         attn_output = attn_weights @ v  # (batch, heads, seq_len, head_dim)
         attn_output = attn_output.transpose(

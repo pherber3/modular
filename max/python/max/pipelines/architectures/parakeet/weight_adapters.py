@@ -14,23 +14,19 @@
 
 Converts HuggingFace safetensors weight names to MAX weight names.
 
-Most weight names pass through unchanged since both HF and MAX use
-``.weight`` and ``.bias`` for all layer types (including Conv1D/Conv2d).
-
-Two transformations are needed for subsampling Conv2d layers:
+Two CTC-specific transformations:
 
 1. **Index remapping**: HF stores conv layers interleaved with ReLU
    activations in a ``ModuleList`` (indices 0, 2, 3, 5, 6), while MAX
    uses ``initial_conv`` for index 0 and ``dw_pw_stages`` Sequential
    (indices 0-3) for the rest.
 
-2. **Weight permutation**: Subsampling Conv2d uses ``permute=False``
-   (to work around a grouped-conv compilation issue on CPU), so weights
-   must be pre-permuted from PyTorch FCRS ``(F, C, R, S)`` to RSCF
-   ``(R, S, C, F)`` format in the adapter.
+2. **Subsampling weight permutation**: Conv2d uses ``permute=False``
+   (grouped-conv compilation workaround), so weights are pre-permuted
+   from PyTorch FCRS to RSCF format.
 
-BatchNorm ``num_batches_tracked`` parameters are skipped (not needed
-at inference).
+Conformer depthwise/pointwise transforms are shared with TDT via
+``weight_utils.py``.
 """
 
 from __future__ import annotations
@@ -39,6 +35,8 @@ from collections.abc import Mapping
 
 import numpy as np
 from max.graph.weights import WeightData, Weights
+
+from .weight_utils import apply_conformer_weight_transforms
 
 # HF subsampling ModuleList indices -> MAX remapped names.
 _SUBSAMPLING_REMAP = {
@@ -73,35 +71,10 @@ def _is_subsampling_conv_weight(key: str) -> bool:
     )
 
 
-def _is_conformer_depthwise_weight(key: str) -> bool:
-    """Check if a key is a conformer depthwise conv weight (needs FCS->SCF permute).
-
-    The depthwise conv is implemented manually (not via Conv1D) to avoid
-    GPU compilation bugs. Weights must be pre-permuted from PyTorch
-    (F, C/groups, K) to SCF (K, C/groups, F).
-    """
-    return key.endswith(".weight") and ".conv.depthwise_conv." in key
-
-
-def _is_conformer_pointwise_weight(key: str) -> bool:
-    """Check if a key is a conformer pointwise conv weight (needs squeeze).
-
-    Pointwise convs are replaced with Linear layers. HF stores weights
-    as (F, C, 1); Linear expects (F, C) — squeeze the kernel dim.
-    """
-    return key.endswith(".weight") and (
-        ".conv.pointwise_conv1." in key or ".conv.pointwise_conv2." in key
-    )
-
-
 def convert_safetensor_state_dict(
     state_dict: Mapping[str, Weights],
 ) -> dict[str, WeightData]:
-    """Convert HuggingFace safetensors state dict to MAX format.
-
-    Remaps subsampling layer indices, permutes subsampling Conv2d weights
-    from FCRS to RSCF, and skips BatchNorm ``num_batches_tracked``.
-    """
+    """Convert HuggingFace safetensors state dict to MAX format."""
     new_state_dict: dict[str, WeightData] = {}
 
     for weight_name, value in state_dict.items():
@@ -111,9 +84,7 @@ def convert_safetensor_state_dict(
         max_name = _remap_subsampling_index(weight_name)
         weight_data = value.data()
 
-        # Permute subsampling Conv2d weights: FCRS (F,C,R,S) -> RSCF (R,S,C,F)
-        # Conv2d uses permute=False to avoid a grouped-conv compilation bug,
-        # so weights must be pre-permuted to RSCF format here.
+        # Permute subsampling Conv2d weights: FCRS -> RSCF
         if _is_subsampling_conv_weight(max_name):
             arr = np.from_dlpack(weight_data)
             weight_data = WeightData.from_numpy(
@@ -121,22 +92,8 @@ def convert_safetensor_state_dict(
                 name=max_name,
             )
 
-        # Permute conformer depthwise conv weights: FCS -> SCF (K,C,F)
-        if _is_conformer_depthwise_weight(max_name):
-            arr = np.from_dlpack(weight_data)
-            weight_data = WeightData.from_numpy(
-                np.ascontiguousarray(arr.transpose(2, 1, 0)),
-                name=max_name,
-            )
-
-        # Squeeze conformer pointwise conv weights: (F,C,1) -> (F,C)
-        # Pointwise convs are now Linear layers.
-        if _is_conformer_pointwise_weight(max_name):
-            arr = np.from_dlpack(weight_data).copy()
-            weight_data = WeightData.from_numpy(
-                np.ascontiguousarray(arr.squeeze(-1)),
-                name=max_name,
-            )
+        # Shared conformer transforms (depthwise permute, pointwise squeeze)
+        weight_data = apply_conformer_weight_transforms(max_name, weight_data)
 
         new_state_dict[max_name] = weight_data
 

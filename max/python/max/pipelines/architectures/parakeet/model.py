@@ -112,7 +112,9 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
         outputs = self.execute(model_inputs)
         assert outputs.logits is not None
         logits = np.from_dlpack(outputs.logits).copy()
-        return ctc_greedy_decode(logits, tokenizer, blank_id=1024)
+        return ctc_greedy_decode(
+            logits, tokenizer, blank_id=self.config.blank_id
+        )
 
     def transcribe(
         self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer

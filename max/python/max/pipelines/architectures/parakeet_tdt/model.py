@@ -45,7 +45,7 @@ from max.pipelines.lib import (
     PipelineConfig,
     PipelineModel,
 )
-from transformers import AutoConfig
+from transformers import AutoConfig, PreTrainedTokenizer
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
 from ..parakeet.encoder import ParakeetEncoder
@@ -81,9 +81,9 @@ def build_graph(
     input_type = TensorType(
         DType.float32,
         # Use fixed num_frames to avoid GPU compiler issues with derived
-        # symbolic dimensions from conv subsampling. 3200 frames ≈ 20s audio.
+        # symbolic dimensions from conv subsampling.
         # Shorter inputs are padded, longer inputs are truncated.
-        shape=[1, 3200, config.num_mel_bins],
+        shape=[1, TDTGraphDecoder.MAX_INPUT_FRAMES, config.num_mel_bins],
         device=config.device,
     )
 
@@ -141,22 +141,51 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
             return_logits,
         )
         self.tdt_config = TDTModelConfig.initialize(self.pipeline_config)
-        self.model = self.load_model(session)
-        self._load_decoder(session)
 
-    def _load_decoder(self, session: InferenceSession) -> None:
-        """Load decoder weights and compile the decoder step graph.
-
-        The encoder projection is now fused into the encoder graph, so
-        only the decoder step graph is compiled here.
-        """
+        # Load decoder/joint NPZ once, split into dicts for encoder
+        # projection and decoder step graphs.
         npz_path = huggingface_hub.hf_hub_download(
             self.pipeline_config.model.model_path, "decoder_joint.npz"
         )
         npz_weights = dict(np.load(npz_path))
-        _proj_dict, pred_dict, joint_dict = convert_decoder_state_dict(
+        proj_dict, pred_dict, joint_dict = convert_decoder_state_dict(
             npz_weights
         )
+
+        self.model = self._load_encoder(session, proj_dict)
+        self._load_decoder(session, pred_dict, joint_dict)
+
+    def _load_encoder(
+        self,
+        session: InferenceSession,
+        proj_dict: dict[str, np.ndarray],
+    ) -> Model:
+        """Compile the encoder + projection graph."""
+        timer = CompilationTimer("Parakeet-TDT")
+
+        if self.adapter:
+            state_dict = self.adapter(self.weights)
+        else:
+            state_dict = {
+                key: value.data() for key, value in self.weights.items()
+            }
+
+        for key, arr in proj_dict.items():
+            state_dict[key] = WeightData.from_numpy(arr.astype(np.float32), key)
+
+        graph = build_graph(self.tdt_config, state_dict)
+        timer.mark_build_complete()
+        model = session.load(graph, weights_registry=state_dict)
+        timer.done()
+        return model
+
+    def _load_decoder(
+        self,
+        session: InferenceSession,
+        pred_dict: dict[str, np.ndarray],
+        joint_dict: dict[str, np.ndarray],
+    ) -> None:
+        """Compile the decoder step graph."""
 
         timer = CompilationTimer("TDT-DecoderStep")
         dec_graph = build_decoder_step_graph(
@@ -227,8 +256,7 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         if self.tdt_config.normalize_features == "per_feature":
             features = normalize_per_feature(features)
         features = features.astype(np.float32)
-        # Pad or truncate to fixed 3200 frames for GPU compatibility.
-        max_frames = 3200
+        max_frames = TDTGraphDecoder.MAX_INPUT_FRAMES
         if features.shape[1] < max_frames:
             pad_width = [(0, 0), (0, max_frames - features.shape[1]), (0, 0)]
             features = np.pad(features, pad_width)
@@ -238,7 +266,9 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
             input_features=Buffer.from_numpy(features).to(self.devices[0])
         )
 
-    def transcribe(self, audio_bytes: bytes, tokenizer: object) -> str:
+    def transcribe(
+        self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer
+    ) -> str:
         """Full audio-to-text pipeline: mel extraction → encoder → TDT decode."""
         audio, sample_rate = read_wav(audio_bytes)
         if sample_rate != 16000:
@@ -275,28 +305,5 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         )
 
     def load_model(self, session: InferenceSession) -> Model:
-        timer = CompilationTimer("Parakeet-TDT")
-
-        if self.adapter:
-            state_dict = self.adapter(self.weights)
-        else:
-            state_dict = {
-                key: value.data() for key, value in self.weights.items()
-            }
-
-        # Merge encoder projection weights from npz into state_dict
-        # so the fused encoder+projection graph can find them.
-        npz_path = huggingface_hub.hf_hub_download(
-            self.pipeline_config.model.model_path, "decoder_joint.npz"
-        )
-        npz_weights = dict(np.load(npz_path))
-        proj_dict, _, _ = convert_decoder_state_dict(npz_weights)
-        for key, arr in proj_dict.items():
-            state_dict[key] = WeightData.from_numpy(arr.astype(np.float32), key)
-
-        graph = build_graph(self.tdt_config, state_dict)
-        timer.mark_build_complete()
-
-        model = session.load(graph, weights_registry=state_dict)
-        timer.done()
-        return model
+        # Required by PipelineModel interface. Actual loading done in __init__.
+        return self.model

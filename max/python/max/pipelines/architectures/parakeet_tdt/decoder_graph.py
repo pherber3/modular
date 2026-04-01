@@ -35,7 +35,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import numpy.typing as npt
-from max.driver import Buffer, Device
+from max.driver import Buffer, Device, DevicePinnedBuffer
 from max.dtype import DType
 from max.engine import Model
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
@@ -256,47 +256,6 @@ class JointNetworkGraph(Module):
 # ---------------------------------------------------------------------------
 
 
-def build_projection_graph(
-    config: TDTModelConfig,
-    state_dict: Mapping[str, np.ndarray],
-) -> Graph:
-    """Build the encoder output projection graph.
-
-    Projects encoder hidden states from encoder_hidden (1024) to
-    joint_hidden (640) dimensions. Run once per utterance.
-
-    Args:
-        config: TDT model configuration.
-        state_dict: Weight dict with ``enc_proj.weight`` and ``enc_proj.bias``.
-
-    Returns:
-        Compiled graph: ``(1, 400, 1024) → (1, 400, 640)``.
-    """
-    # Fixed T=400 from encoder's 3200 frames / 8x subsampling
-    input_type = TensorType(
-        DType.float32,
-        shape=[1, 400, config.hidden_size],
-        device=config.device,
-    )
-
-    with Graph("tdt_encoder_projection", input_types=[input_type]) as graph:
-        enc_proj = Linear(
-            in_dim=config.hidden_size,
-            out_dim=config.joint_hidden,
-            dtype=DType.float32,
-            device=config.device,
-            has_bias=True,
-            name="enc_proj",
-        )
-        enc_proj.load_state_dict(state_dict)
-
-        encoder_output = graph.inputs[0].tensor
-        projected = enc_proj(encoder_output)
-        graph.output(projected)
-
-    return graph
-
-
 def build_decoder_step_graph(
     config: TDTModelConfig,
     prediction_state_dict: Mapping[str, np.ndarray],
@@ -324,8 +283,7 @@ def build_decoder_step_graph(
     num_durations = len(config.tdt_durations)
     output_size = vocab_size + 1 + num_durations  # vocab + blank + durations
     device = config.device
-    # Fixed T=400 from encoder's 3200 frames / 8x subsampling
-    max_encoder_len = 400
+    max_encoder_len = TDTGraphDecoder.MAX_ENCODER_FRAMES
 
     # 7 inputs: token_id, h0, c0, h1, c1, enc_projected, t_index
     input_types = [
@@ -492,9 +450,13 @@ class TDTGraphDecoder:
 
     The encoder graph already includes the projection (1024→640), so
     this class only runs the decoder step graph in a loop. All buffers
-    are pre-allocated at init using DevicePinnedBuffer for fast
-    CPU↔GPU transfers.
+    are pre-allocated at init for zero-allocation decode loops.
     """
+
+    # Fixed input/encoder frame counts. 3200 mel frames ≈ 20s audio at
+    # 16kHz with hop=160. 8x subsampling → 400 encoder timesteps.
+    MAX_INPUT_FRAMES = 3200
+    MAX_ENCODER_FRAMES = MAX_INPUT_FRAMES // 8  # 400
 
     def __init__(
         self,
@@ -515,7 +477,7 @@ class TDTGraphDecoder:
         self.joint_hidden = config.joint_hidden
 
         # Pre-allocate ALL small buffers at init.
-        max_t = 400
+        max_t = self.MAX_ENCODER_FRAMES
         self._t_index_bufs = [
             Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
             for t in range(max_t)
@@ -548,9 +510,10 @@ class TDTGraphDecoder:
                 }
             )
 
-        # Pinned buffer for async D2H readback of decisions.
-        from max.driver import DevicePinnedBuffer
+        # Pre-allocated zero buffer for resetting LSTM states per utterance.
+        self._zero_buf = Buffer.from_numpy(zero.copy()).to(device)
 
+        # Pinned buffer for async D2H readback of decisions.
         self._decisions_pinned = DevicePinnedBuffer(
             dtype=DType.int32, shape=(2,), device=device
         )
@@ -620,7 +583,7 @@ class TDTGraphDecoder:
         Returns:
             List of token ID sequences (one per batch element).
         """
-        T = 400
+        T = self.MAX_ENCODER_FRAMES
 
         if not self._captured:
             self._capture_graphs(enc_projected)
@@ -629,14 +592,11 @@ class TDTGraphDecoder:
             self._enc_proj_buf.inplace_copy_from(enc_projected)
 
         # Reset LSTM states to zero for both buffer sets.
-        zero = Buffer.from_numpy(
-            np.zeros((1, self.pred_hidden), dtype=np.float32)
-        ).to(self.device)
         for i in range(2):
-            self._bufs[i]["h0"].inplace_copy_from(zero)
-            self._bufs[i]["c0"].inplace_copy_from(zero)
-            self._bufs[i]["h1"].inplace_copy_from(zero)
-            self._bufs[i]["c1"].inplace_copy_from(zero)
+            self._bufs[i]["h0"].inplace_copy_from(self._zero_buf)
+            self._bufs[i]["c0"].inplace_copy_from(self._zero_buf)
+            self._bufs[i]["h1"].inplace_copy_from(self._zero_buf)
+            self._bufs[i]["c1"].inplace_copy_from(self._zero_buf)
 
         # SOS step: replay graph 0 with blank token at t=0.
         cur = 0  # Current buffer set index (input side)
@@ -701,10 +661,6 @@ class TDTGraphDecoder:
                 outs = self._captured_outputs[cur]
                 decisions_dev = outs[0]
                 self._decisions_pinned.inplace_copy_from(decisions_dev)
-                # TODO: Use DeviceEvent here once we verify it works:
-                # event = self.device.default_stream.record_event()
-                # ... do CPU-side prep ...
-                # event.synchronize()
 
                 # Copy LSTM states to next set's input buffers.
                 nxt = 1 - cur
