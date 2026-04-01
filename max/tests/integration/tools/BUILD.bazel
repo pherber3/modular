@@ -483,6 +483,28 @@ modular_py_binary(
 )
 
 modular_py_binary(
+    name = "profile_decoder_step",
+    testonly = True,
+    srcs = ["profile_decoder_step.py"],
+    imports = ["."],
+    main = "profile_decoder_step.py",
+    tags = [
+        "no-pydeps",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        "//max/python/max/nn",
+        "//max/python/max/pipelines/architectures",
+        requirement("huggingface-hub"),
+        requirement("numpy"),
+        requirement("transformers"),
+    ],
+)
+
+modular_py_binary(
     name = "compare_tensors",
     testonly = True,
     srcs = ["compare_tensors.py"],
