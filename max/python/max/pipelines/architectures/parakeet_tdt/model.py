@@ -45,6 +45,7 @@ from max.pipelines.lib import (
     PipelineConfig,
     PipelineModel,
 )
+from max.pipelines.lib.utils import parse_state_dict_from_weights
 from transformers import AutoConfig, PreTrainedTokenizer
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
@@ -162,12 +163,9 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
     ) -> Model:
         """Compile the encoder + projection graph."""
         with CompilationTimer("Parakeet-TDT") as timer:
-            if self.adapter:
-                state_dict = self.adapter(self.weights)
-            else:
-                state_dict = {
-                    key: value.data() for key, value in self.weights.items()
-                }
+            state_dict = parse_state_dict_from_weights(
+                self.pipeline_config, self.weights, self.adapter
+            )
 
             for key, arr in proj_dict.items():
                 state_dict[key] = WeightData.from_numpy(

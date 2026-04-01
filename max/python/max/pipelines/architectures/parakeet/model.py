@@ -37,6 +37,7 @@ from max.pipelines.lib import (
     PipelineConfig,
     PipelineModel,
 )
+from max.pipelines.lib.utils import parse_state_dict_from_weights
 from transformers import AutoConfig, PreTrainedTokenizer
 
 from .audio import extract_mel, normalize_per_feature, read_wav
@@ -166,12 +167,9 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
 
     def load_model(self, session: InferenceSession) -> Model:
         with CompilationTimer("Parakeet-CTC") as timer:
-            if self.adapter:
-                state_dict = self.adapter(dict(self.weights.items()))
-            else:
-                state_dict = {
-                    key: value.data() for key, value in self.weights.items()
-                }
+            state_dict = parse_state_dict_from_weights(
+                self.pipeline_config, self.weights, self.adapter
+            )
 
             graph = build_graph(self.config, state_dict)
             timer.mark_build_complete()
