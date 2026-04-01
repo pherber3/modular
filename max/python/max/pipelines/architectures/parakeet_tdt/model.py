@@ -161,22 +161,22 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         proj_dict: dict[str, np.ndarray],
     ) -> Model:
         """Compile the encoder + projection graph."""
-        timer = CompilationTimer("Parakeet-TDT")
+        with CompilationTimer("Parakeet-TDT") as timer:
+            if self.adapter:
+                state_dict = self.adapter(self.weights)
+            else:
+                state_dict = {
+                    key: value.data() for key, value in self.weights.items()
+                }
 
-        if self.adapter:
-            state_dict = self.adapter(self.weights)
-        else:
-            state_dict = {
-                key: value.data() for key, value in self.weights.items()
-            }
+            for key, arr in proj_dict.items():
+                state_dict[key] = WeightData.from_numpy(
+                    arr.astype(np.float32), key
+                )
 
-        for key, arr in proj_dict.items():
-            state_dict[key] = WeightData.from_numpy(arr.astype(np.float32), key)
-
-        graph = build_graph(self.tdt_config, state_dict)
-        timer.mark_build_complete()
-        model = session.load(graph, weights_registry=state_dict)
-        timer.done()
+            graph = build_graph(self.tdt_config, state_dict)
+            timer.mark_build_complete()
+            model = session.load(graph, weights_registry=state_dict)
         return model
 
     def _load_decoder(
@@ -186,17 +186,15 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         joint_dict: dict[str, np.ndarray],
     ) -> None:
         """Compile the decoder step graph."""
-
-        timer = CompilationTimer("TDT-DecoderStep")
-        dec_graph = build_decoder_step_graph(
-            self.tdt_config, pred_dict, joint_dict
-        )
-        timer.mark_build_complete()
-        dec_weights = {**pred_dict, **joint_dict}
-        decoder_step_model = session.load(
-            dec_graph, weights_registry=dec_weights
-        )
-        timer.done()
+        with CompilationTimer("TDT-DecoderStep") as timer:
+            dec_graph = build_decoder_step_graph(
+                self.tdt_config, pred_dict, joint_dict
+            )
+            timer.mark_build_complete()
+            dec_weights = {**pred_dict, **joint_dict}
+            decoder_step_model = session.load(
+                dec_graph, weights_registry=dec_weights
+            )
 
         cpu_device = load_devices([DeviceSpec.cpu()])[0]
 

@@ -165,18 +165,16 @@ class ParakeetPipelineModel(PipelineModel[TextContext]):
         )
 
     def load_model(self, session: InferenceSession) -> Model:
-        timer = CompilationTimer("Parakeet-CTC")
+        with CompilationTimer("Parakeet-CTC") as timer:
+            if self.adapter:
+                state_dict = self.adapter(dict(self.weights.items()))
+            else:
+                state_dict = {
+                    key: value.data() for key, value in self.weights.items()
+                }
 
-        if self.adapter:
-            state_dict = self.adapter(dict(self.weights.items()))
-        else:
-            state_dict = {
-                key: value.data() for key, value in self.weights.items()
-            }
+            graph = build_graph(self.config, state_dict)
+            timer.mark_build_complete()
 
-        graph = build_graph(self.config, state_dict)
-        timer.mark_build_complete()
-
-        model = session.load(graph, weights_registry=state_dict)
-        timer.done()
+            model = session.load(graph, weights_registry=state_dict)
         return model

@@ -209,7 +209,7 @@ class ParakeetConvModule(Module):
         )
         self.depthwise_conv = DepthwiseConv1D(
             channels=channels,
-            kernel_size=self.kernel_size,
+            kernel_size=config.conv_kernel_size,
             dtype=config.dtype,
             device=config.device,
             has_bias=conv_bias,
