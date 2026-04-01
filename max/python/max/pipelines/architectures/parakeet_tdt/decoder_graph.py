@@ -35,7 +35,7 @@ from collections.abc import Mapping
 
 import numpy as np
 import numpy.typing as npt
-from max.driver import Buffer, Device
+from max.driver import Buffer, Device, DevicePinnedBuffer
 from max.dtype import DType
 from max.engine import Model
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, Weight, ops
@@ -484,21 +484,21 @@ def convert_decoder_state_dict(
 
 
 class TDTGraphDecoder:
-    """Manages TDT decoding using compiled MAX graphs.
+    """Manages TDT decoding using the compiled decoder step graph.
 
-    Runs the projection graph once, then loops the decoder step graph
-    with LSTM state Buffers flowing between iterations on GPU.
+    The encoder graph already includes the projection (1024→640), so
+    this class only runs the decoder step graph in a loop. All buffers
+    are pre-allocated at init using DevicePinnedBuffer for fast
+    CPU↔GPU transfers.
     """
 
     def __init__(
         self,
-        projection_model: Model,
         decoder_step_model: Model,
         config: TDTModelConfig,
         device: Device,
         cpu_device: Device,
     ) -> None:
-        self.projection_model = projection_model
         self.decoder_step_model = decoder_step_model
         self.config = config
         self.device = device
@@ -511,56 +511,58 @@ class TDTGraphDecoder:
         self.joint_hidden = config.joint_hidden
 
         # Pre-allocate time index buffers for all 400 possible timesteps.
-        # Eliminates Buffer.from_numpy().to(device) per step (~0.15ms each).
         max_t = 400
         self._t_index_bufs = [
             Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
             for t in range(max_t)
         ]
 
-        # Pre-allocate token buffer on GPU + CPU staging buffer.
-        # Use inplace_copy_from to update the GPU buffer each step
-        # instead of creating a new Buffer.
-        self._token_cpu = np.array([[config.blank_id]], dtype=np.int32)
-        self._token_gpu = Buffer.from_numpy(self._token_cpu.copy()).to(device)
+        # Pre-allocate token buffer using pinned memory for fast transfers.
+        # DevicePinnedBuffer gives a numpy-writable host buffer with fast
+        # GPU copy via inplace_copy_from.
+        self._token_pinned = DevicePinnedBuffer(
+            dtype=DType.int32, shape=(1, 1), device=device
+        )
+        self._token_np = self._token_pinned.to_numpy()
+        self._token_np[0, 0] = config.blank_id
+        self._token_gpu = Buffer.from_numpy(
+            np.array([[config.blank_id]], dtype=np.int32)
+        ).to(device)
 
-    def decode(self, encoder_output: Buffer) -> list[list[int]]:
-        """Run full TDT decode: projection + greedy loop.
+    def decode(self, enc_projected: Buffer) -> list[list[int]]:
+        """Run TDT greedy decode on pre-projected encoder output.
 
         Args:
-            encoder_output: Encoder hidden states on GPU,
-                shape ``(1, T, encoder_hidden)``.
+            enc_projected: Pre-projected encoder output on GPU,
+                shape ``(1, T, joint_hidden)``. Already includes the
+                joint.enc projection from the fused encoder graph.
 
         Returns:
             List of token ID sequences (one per batch element).
         """
-        # Step 1: Pre-project encoder output on device (once per utterance).
-        # projected_buf stays on device — no CPU transfer.
-        proj_outputs = self.projection_model.execute(encoder_output)
-        projected_buf = proj_outputs[0]  # (1, 400, joint_hidden) on device
         T = 400  # Fixed from encoder's 3200 frames / 8x subsampling
 
-        # Step 2: Initialize LSTM states as zero Buffers on device.
+        # Initialize LSTM states as zero Buffers on device.
         zero_state = np.zeros((1, self.pred_hidden), dtype=np.float32)
         h0 = Buffer.from_numpy(zero_state).to(self.device)
         c0 = Buffer.from_numpy(zero_state).to(self.device)
         h1 = Buffer.from_numpy(zero_state).to(self.device)
         c1 = Buffer.from_numpy(zero_state).to(self.device)
 
-        # Initial token: blank (SOS) — use pre-allocated GPU buffer.
-        self._token_cpu[0, 0] = self.blank_id
+        # Reset token buffer to blank (SOS) via pinned memory.
+        self._token_np[0, 0] = self.blank_id
         token_buf = self._token_gpu
-        token_buf.inplace_copy_from(Buffer.from_numpy(self._token_cpu))
+        token_buf.inplace_copy_from(self._token_pinned)
 
         # Run initial prediction step to get SOS state.
         outputs = self.decoder_step_model.execute(
-            token_buf, h0, c0, h1, c1, projected_buf, self._t_index_bufs[0]
+            token_buf, h0, c0, h1, c1, enc_projected, self._t_index_bufs[0]
         )
         _, _, h0, c0, h1, c1 = outputs
 
-        # Step 3: Greedy decode loop.
-        # Per step: pre-allocated t_index lookup + readback (8 bytes).
-        # No Buffer.from_numpy().to(device) in the hot loop.
+        # Greedy decode loop.
+        # Per step: pre-allocated t_index lookup + pinned token update +
+        # readback (8 bytes). No Buffer allocation in the hot loop.
         tokens: list[int] = []
         t = 0
         max_symbols_per_step = 10
@@ -575,7 +577,7 @@ class TDTGraphDecoder:
                     c0,
                     h1,
                     c1,
-                    projected_buf,
+                    enc_projected,
                     self._t_index_bufs[t],
                 )
                 token_buf_out, dur_idx_buf, h0, c0, h1, c1 = outputs
@@ -593,10 +595,11 @@ class TDTGraphDecoder:
                     t += max(duration, 1)
                     break
 
-                # Non-blank: emit token, update GPU token buffer in-place.
+                # Non-blank: emit token, update GPU token buffer via
+                # pinned memory (write to numpy view, copy pinned→GPU).
                 tokens.append(token)
-                self._token_cpu[0, 0] = token
-                token_buf.inplace_copy_from(Buffer.from_numpy(self._token_cpu))
+                self._token_np[0, 0] = token
+                token_buf.inplace_copy_from(self._token_pinned)
                 symbols_at_t += 1
 
                 if duration > 0:

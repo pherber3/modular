@@ -28,11 +28,12 @@ from dataclasses import dataclass
 import huggingface_hub
 import numpy as np
 import numpy.typing as npt
-from max.driver import Buffer, Device, DLPackArray
+from max.driver import Buffer, Device, DeviceSpec, DLPackArray, load_devices
 from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import Graph, TensorType
 from max.graph.weights import WeightData, Weights, WeightsAdapter
+from max.nn import Linear
 from max.nn.kv_cache import KVCacheInputs
 from max.nn.transformer import ReturnLogits
 from max.pipelines.core import TextContext
@@ -51,7 +52,6 @@ from ..parakeet.encoder import ParakeetEncoder
 from .decoder_graph import (
     TDTGraphDecoder,
     build_decoder_step_graph,
-    build_projection_graph,
     convert_decoder_state_dict,
 )
 from .model_config import TDTModelConfig
@@ -72,10 +72,11 @@ def build_graph(
     config: TDTModelConfig,
     state_dict: Mapping[str, DLPackArray | WeightData],
 ) -> Graph:
-    """Build the encoder-only computation graph for Parakeet-TDT.
+    """Build the encoder + joint-encoder-projection computation graph.
 
-    The graph takes mel spectrogram input and returns encoder hidden states.
-    TDT decoding (LSTM + joint) runs in Python after this graph executes.
+    The graph takes mel spectrogram input and returns the pre-projected
+    encoder output ``(1, T, joint_hidden)``. Fusing the projection here
+    eliminates a separate model.execute() call per utterance.
     """
     input_type = TensorType(
         DType.float32,
@@ -91,7 +92,19 @@ def build_graph(
         encoder.load_state_dict(state_dict)
         input_features = graph.inputs[0].tensor
         hidden_states = encoder(input_features)
-        graph.output(hidden_states)
+
+        enc_proj = Linear(
+            in_dim=config.hidden_size,
+            out_dim=config.joint_hidden,
+            dtype=DType.float32,
+            device=config.device,
+            has_bias=True,
+            name="enc_proj",
+        )
+        enc_proj.load_state_dict(state_dict)
+        enc_projected = enc_proj(hidden_states)
+
+        graph.output(enc_projected)
 
     return graph
 
@@ -132,44 +145,33 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         self._load_decoder(session)
 
     def _load_decoder(self, session: InferenceSession) -> None:
-        """Load decoder weights and compile projection + step graphs.
+        """Load decoder weights and compile the decoder step graph.
 
-        Builds two MAX graphs that run on the same device as the encoder:
-        1. Projection graph — pre-projects encoder output (1024→640) once
-        2. Decoder step graph — one LSTM + joint step, called in a loop
+        The encoder projection is now fused into the encoder graph, so
+        only the decoder step graph is compiled here.
         """
         npz_path = huggingface_hub.hf_hub_download(
             self.pipeline_config.model.model_path, "decoder_joint.npz"
         )
         npz_weights = dict(np.load(npz_path))
-        proj_dict, pred_dict, joint_dict = convert_decoder_state_dict(
+        _proj_dict, pred_dict, joint_dict = convert_decoder_state_dict(
             npz_weights
         )
-
-        timer = CompilationTimer("TDT-Projection")
-        proj_graph = build_projection_graph(self.tdt_config, proj_dict)
-        timer.mark_build_complete()
-        projection_model = session.load(proj_graph, weights_registry=proj_dict)
-        timer.done()
 
         timer = CompilationTimer("TDT-DecoderStep")
         dec_graph = build_decoder_step_graph(
             self.tdt_config, pred_dict, joint_dict
         )
         timer.mark_build_complete()
-        # Merge prediction + joint dicts for the weights_registry
         dec_weights = {**pred_dict, **joint_dict}
         decoder_step_model = session.load(
             dec_graph, weights_registry=dec_weights
         )
         timer.done()
 
-        from max.driver import DeviceSpec, load_devices
-
         cpu_device = load_devices([DeviceSpec.cpu()])[0]
 
         self.graph_decoder = TDTGraphDecoder(
-            projection_model=projection_model,
             decoder_step_model=decoder_step_model,
             config=self.tdt_config,
             device=self.devices[0],
@@ -177,7 +179,7 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
         )
         logger.info(
             "Loaded TDT decoder (MAX graph, device=%s): "
-            "projection + step graphs compiled",
+            "decoder step graph compiled",
             self.tdt_config.device,
         )
 
@@ -281,6 +283,16 @@ class ParakeetTDTPipelineModel(PipelineModel[TextContext]):
             state_dict = {
                 key: value.data() for key, value in self.weights.items()
             }
+
+        # Merge encoder projection weights from npz into state_dict
+        # so the fused encoder+projection graph can find them.
+        npz_path = huggingface_hub.hf_hub_download(
+            self.pipeline_config.model.model_path, "decoder_joint.npz"
+        )
+        npz_weights = dict(np.load(npz_path))
+        proj_dict, _, _ = convert_decoder_state_dict(npz_weights)
+        for key, arr in proj_dict.items():
+            state_dict[key] = WeightData.from_numpy(arr.astype(np.float32), key)
 
         graph = build_graph(self.tdt_config, state_dict)
         timer.mark_build_complete()
