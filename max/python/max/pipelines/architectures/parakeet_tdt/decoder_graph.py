@@ -590,16 +590,19 @@ class TDTGraphDecoder:
                 replay(1, token_buf, lstm_buf, enc_proj_buf, t_buf)
 
                 decisions_pinned.inplace_copy_from(outs[0])
-                lstm_buf.inplace_copy_from(outs[1])
 
                 token = int(decisions_np[0])
                 dur_idx = int(decisions_np[1])
                 duration = durations[dur_idx]
 
                 if token == blank_id:
+                    # LSTM state unchanged on blank — same token input
+                    # produces identical h/c. Skip the copy.
                     t += max(duration, 1)
                     break
 
+                # Non-blank: LSTM state changed, must copy.
+                lstm_buf.inplace_copy_from(outs[1])
                 tokens.append(token)
                 token_buf.inplace_copy_from(token_bufs[token])
                 symbols_at_t += 1
