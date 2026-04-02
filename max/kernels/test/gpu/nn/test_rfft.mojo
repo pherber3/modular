@@ -96,17 +96,20 @@ def test_rfft_basic[
             output_host, output_runtime_layout
         ).make_dynamic[DType.int64]()
 
+        var expected_dc = Scalar[dtype](input_size)
+        var expected_zero = Scalar[dtype](0)
+
         for b in range(batch_size):
             # DC bin: real part should be input_size, imag part should be 0
             assert_almost_equal(
                 output_tensor[b, 0],
-                Float32(input_size),
+                expected_dc,
                 rtol=0.01,
                 msg="DC real component should equal input_size",
             )
             assert_almost_equal(
                 output_tensor[b, 1],
-                Float32(0.0),
+                expected_zero,
                 rtol=0.01,
                 atol=1e-5,
                 msg="DC imaginary component should be zero",
@@ -116,14 +119,14 @@ def test_rfft_basic[
             for i in range(1, input_size // 2 + 1):
                 assert_almost_equal(
                     output_tensor[b, 2 * i],
-                    Float32(0.0),
+                    expected_zero,
                     rtol=0.01,
                     atol=1e-5,
                     msg="Non-DC real component should be zero",
                 )
                 assert_almost_equal(
                     output_tensor[b, 2 * i + 1],
-                    Float32(0.0),
+                    expected_zero,
                     rtol=0.01,
                     atol=1e-5,
                     msg="Non-DC imaginary component should be zero",
