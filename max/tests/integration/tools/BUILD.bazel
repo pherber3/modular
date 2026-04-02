@@ -591,6 +591,64 @@ modular_py_binary(
 )
 
 modular_py_binary(
+    name = "test_tdt_megakernel",
+    testonly = True,
+    srcs = ["test_tdt_megakernel.py"],
+    data = [":parakeet_kernel_sources"],
+    imports = ["."],
+    main = "test_tdt_megakernel.py",
+    mojo_deps = [
+        "//max:compiler",
+        "//max:layout",
+        "//max:MOGGKernelAPI",
+        "//max:tensor",
+        "@mojo//:std",
+    ],
+    tags = [
+        "gpu",
+        "no-pydeps",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("huggingface-hub"),
+        requirement("numpy"),
+    ],
+)
+
+modular_py_binary(
+    name = "bench_tdt_megakernel",
+    testonly = True,
+    srcs = ["bench_tdt_megakernel.py"],
+    data = [":parakeet_kernel_sources"],
+    imports = ["."],
+    main = "bench_tdt_megakernel.py",
+    mojo_deps = [
+        "//max:compiler",
+        "//max:layout",
+        "//max:MOGGKernelAPI",
+        "//max:tensor",
+        "@mojo//:std",
+    ],
+    tags = [
+        "gpu",
+        "no-pydeps",
+        "requires-network",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("huggingface-hub"),
+        requirement("numpy"),
+    ],
+)
+
+modular_py_binary(
     name = "profile_decoder_step",
     testonly = True,
     srcs = ["profile_decoder_step.py"],
