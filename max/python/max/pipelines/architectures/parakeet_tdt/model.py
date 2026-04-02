@@ -54,6 +54,7 @@ from ..parakeet.mel_graph import MAX_AUDIO_SAMPLES, N_FFT, build_mel_graph
 from .decoder_graph import (
     TDTGraphDecoder,
     build_decoder_step_graph,
+    build_fused_decoder_step_graph,
     convert_decoder_state_dict,
 )
 from .model_config import TDTModelConfig
@@ -197,11 +198,31 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
         pred_dict: dict[str, np.ndarray],
         joint_dict: dict[str, np.ndarray],
     ) -> None:
-        """Compile the decoder step graph."""
+        """Compile the decoder step graph.
+
+        On GPU, uses the fused Mojo kernel (single kernel launch per step).
+        On CPU, falls back to the multi-op MAX graph.
+        """
+        use_fused = self.tdt_config.device != DeviceRef.CPU()
+
         with CompilationTimer("TDT-DecoderStep") as timer:
-            dec_graph = build_decoder_step_graph(
-                self.tdt_config, pred_dict, joint_dict
-            )
+            if use_fused:
+                try:
+                    dec_graph = build_fused_decoder_step_graph(
+                        self.tdt_config, pred_dict, joint_dict
+                    )
+                except RuntimeError:
+                    logger.warning(
+                        "Fused kernel not available, falling back to MAX graph"
+                    )
+                    use_fused = False
+                    dec_graph = build_decoder_step_graph(
+                        self.tdt_config, pred_dict, joint_dict
+                    )
+            else:
+                dec_graph = build_decoder_step_graph(
+                    self.tdt_config, pred_dict, joint_dict
+                )
             timer.mark_build_complete()
             dec_weights = {**pred_dict, **joint_dict}
             decoder_step_model = session.load(
@@ -216,9 +237,10 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             device=self.devices[0],
             cpu_device=cpu_device,
         )
+        variant = "fused Mojo kernel" if use_fused else "MAX graph"
         logger.info(
-            "Loaded TDT decoder (MAX graph, device=%s): "
-            "decoder step graph compiled",
+            "Loaded TDT decoder (%s, device=%s): decoder step graph compiled",
+            variant,
             self.tdt_config.device,
         )
 

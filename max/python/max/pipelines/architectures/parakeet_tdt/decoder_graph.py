@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
@@ -358,6 +359,168 @@ def build_decoder_step_graph(
         )  # (1, 2) int32
 
         graph.output(decisions, lstm_state_packed_new)
+
+    return graph
+
+
+def build_fused_decoder_step_graph(
+    config: TDTModelConfig,
+    prediction_state_dict: Mapping[str, np.ndarray],
+    joint_state_dict: Mapping[str, np.ndarray],
+) -> Graph:
+    """Build the fused Mojo kernel decoder step graph for TDT.
+
+    Replaces the multi-op MAX graph with a single fused Mojo kernel that
+    performs: embedding + 2-layer LSTM + joint network + argmax in one GPU
+    kernel launch. Same 4-input / 2-output contract as
+    :func:`build_decoder_step_graph`, so :class:`TDTGraphDecoder` needs no
+    changes.
+
+    GPU only — falls back to :func:`build_decoder_step_graph` on CPU.
+
+    Args:
+        config: TDT model configuration.
+        prediction_state_dict: Weights for prediction network
+            (keys relative to prediction module).
+        joint_state_dict: Weights for joint network
+            (keys relative to joint module).
+
+    Returns:
+        Compiled graph with 4 inputs and 2 outputs
+        (decisions, lstm_state_packed).
+    """
+    pred_hidden = config.pred_hidden
+    joint_hidden = config.joint_hidden
+    vocab_size = config.vocab_size
+    num_durations = len(config.tdt_durations)
+    output_size = vocab_size + 1 + num_durations
+    device = config.device
+    max_encoder_len = TDTGraphDecoder.MAX_ENCODER_FRAMES
+    # Locate the pre-compiled kernel package (.mojopkg). Must be built
+    # separately to avoid mojo_deps in the pipeline's dependency graph
+    # (mojo_deps poisons MAX's graph compiler — see benchmark-results.md).
+    #
+    # Build: bazel build //max/tests/integration/tools:parakeet_kernel_pkg
+    # Or:    PARAKEET_KERNEL_PKG=/path/to/pkg.mojopkg
+    import os
+
+    env_pkg = os.environ.get("PARAKEET_KERNEL_PKG")
+    if env_pkg:
+        kernel_pkg = Path(env_pkg)
+    else:
+        kernels_dir = Path(__file__).resolve().parent / "kernels"
+        candidates = [
+            kernels_dir / "parakeet_tdt_kernels.mojopkg",
+            kernels_dir.parent.parent / "parakeet_tdt_kernels.mojopkg",
+        ]
+        kernel_pkg = next((p for p in candidates if p.exists()), None)
+
+    if kernel_pkg is None:
+        raise RuntimeError(
+            "Pre-compiled kernel package not found. Either:\n"
+            "  1. Set PARAKEET_KERNEL_PKG=/path/to/parakeet_tdt_kernels.mojopkg\n"
+            "  2. Copy the .mojopkg into the kernels/ directory"
+        )
+
+    # Same 4 dynamic inputs as the standard graph.
+    input_types = [
+        TensorType(DType.int32, shape=[1, 1], device=device),
+        TensorType(DType.float32, shape=[1, 4 * pred_hidden], device=device),
+        TensorType(
+            DType.float32,
+            shape=[1, max_encoder_len, joint_hidden],
+            device=device,
+        ),
+        TensorType(DType.int32, shape=[1], device=device),
+    ]
+
+    with Graph(
+        "tdt_decoder_step_fused",
+        input_types=input_types,
+        custom_extensions=[kernel_pkg],
+    ) as graph:
+        token_id = graph.inputs[0].tensor  # (1, 1)
+        lstm_state_packed = graph.inputs[1].tensor  # (1, 2560)
+        enc_projected = graph.inputs[2].tensor  # (1, 400, 640)
+        t_index = graph.inputs[3].tensor  # (1,)
+
+        # Slice encoder at timestep t: (1, 400, 640) → (1, 640)
+        enc_t = ops.gather(enc_projected, t_index, axis=1)
+        enc_t = ops.squeeze(enc_t, 1)
+
+        # Kernel expects token_id as rank-1 (1,), not (1, 1).
+        token_flat = ops.reshape(token_id, [1])
+
+        # Weight objects — names must match keys in the merged
+        # {**prediction_state_dict, **joint_state_dict} registry.
+        # Order MUST match kernel parameter order in tdt_decode_step.mojo.
+        weight_spec: list[tuple[str, tuple[int, ...], Mapping]] = [
+            ("embedding", (vocab_size + 1, pred_hidden), prediction_state_dict),
+            (
+                "lstm_0.ih.weight",
+                (4 * pred_hidden, pred_hidden),
+                prediction_state_dict,
+            ),
+            ("lstm_0.ih.bias", (4 * pred_hidden,), prediction_state_dict),
+            (
+                "lstm_0.hh.weight",
+                (4 * pred_hidden, pred_hidden),
+                prediction_state_dict,
+            ),
+            ("lstm_0.hh.bias", (4 * pred_hidden,), prediction_state_dict),
+            (
+                "lstm_1.ih.weight",
+                (4 * pred_hidden, pred_hidden),
+                prediction_state_dict,
+            ),
+            ("lstm_1.ih.bias", (4 * pred_hidden,), prediction_state_dict),
+            (
+                "lstm_1.hh.weight",
+                (4 * pred_hidden, pred_hidden),
+                prediction_state_dict,
+            ),
+            ("lstm_1.hh.bias", (4 * pred_hidden,), prediction_state_dict),
+            ("pred_proj.weight", (joint_hidden, pred_hidden), joint_state_dict),
+            ("pred_proj.bias", (joint_hidden,), joint_state_dict),
+            (
+                "output_proj.weight",
+                (output_size, joint_hidden),
+                joint_state_dict,
+            ),
+            ("output_proj.bias", (output_size,), joint_state_dict),
+        ]
+
+        weight_values: list[TensorValue] = []
+        for name, expected_shape, state_dict in weight_spec:
+            w = Weight(
+                name=name,
+                dtype=DType.float32,
+                shape=expected_shape,
+                device=device,
+            )
+            # Verify shape matches the actual weight at graph build time.
+            if name in state_dict:
+                actual = state_dict[name].shape
+                assert actual == expected_shape, (
+                    f"Weight {name!r}: expected shape {expected_shape}, "
+                    f"got {actual}"
+                )
+            weight_values.append(w)
+
+        decisions, state_new = ops.custom(
+            name="tdt_decode_step",
+            device=device,
+            values=[enc_t, token_flat, lstm_state_packed, *weight_values],
+            out_types=[
+                TensorType(dtype=DType.int32, shape=[1, 2], device=device),
+                TensorType(
+                    dtype=DType.float32,
+                    shape=[1, 4 * pred_hidden],
+                    device=device,
+                ),
+            ],
+        )
+        graph.output(decisions.tensor, state_new.tensor)
 
     return graph
 
