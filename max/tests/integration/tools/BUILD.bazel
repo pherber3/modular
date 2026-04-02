@@ -470,6 +470,7 @@ modular_py_binary(
         "//max/python/max/driver",
         "//max/python/max/engine",
         "//max/python/max/graph",
+        "//max/python/max/pipelines/architectures",
         requirement("numpy"),
     ],
 )
