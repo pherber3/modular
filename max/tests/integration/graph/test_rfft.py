@@ -68,9 +68,9 @@ def test_rfft(
     normalization: str,
 ) -> None:
     assert md.accelerator_count() > 0, "No GPU available"
-    assert (
-        md.accelerator_api() == "cuda"
-    ), "NVIDIA GPUs are required for this test."
+    assert md.accelerator_api() == "cuda", (
+        "NVIDIA GPUs are required for this test."
+    )
     input_tensor = torch.randn(*input_shape, dtype=torch.float32).to("cuda")
     max_out = max_rfft(session, input_tensor, n, axis, normalization)
     torch_out = torch_rfft(input_tensor, n, axis, normalization)

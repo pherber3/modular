@@ -51,9 +51,7 @@ def test_rfft_basic[
     var output_runtime_layout = row_major(output_shape)
 
     # Create device buffers
-    var input_device = ctx.enqueue_create_buffer[dtype](
-        batch_size * input_size
-    )
+    var input_device = ctx.enqueue_create_buffer[dtype](batch_size * input_size)
     var output_device = ctx.enqueue_create_buffer[dtype](
         batch_size * output_size
     )

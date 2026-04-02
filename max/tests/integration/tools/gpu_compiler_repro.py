@@ -1,3 +1,16 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
 """Minimal reproduction of MAX GPU compiler issues.
 
 Demonstrates two bugs that affect conformer-style ASR models:
@@ -47,9 +60,9 @@ def run_test(
     weight_specs: list[tuple[str, tuple[int, ...]]] | None = None,
 ) -> bool:
     """Build, compile, and optionally execute a graph."""
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"TEST: {name}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     try:
         graph = build_fn(device)
         weights = _make_conv_weights(weight_specs) if weight_specs else {}
@@ -340,9 +353,9 @@ def main() -> None:
         ok = run_test(name, device, devices, fn, shapes, compile_only, wspec)
         results.append((name, ok))
 
-    print(f"\n\n{'='*70}")
+    print(f"\n\n{'=' * 70}")
     print("SUMMARY")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     for name, ok in results:
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] {name}")

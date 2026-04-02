@@ -1,3 +1,16 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ===----------------------------------------------------------------------=== #
+
 #!/usr/bin/env python3
 """Convert a Parakeet-TDT .nemo model to MAX-compatible format.
 
@@ -119,7 +132,9 @@ def extract_nemo(nemo_path: Path, tmpdir: Path) -> NemoContents:
                 tokenizer_model = p
             tokenizer_files.append(p)
 
-    return NemoContents(yaml_config, state_dict, tokenizer_model, tokenizer_files)
+    return NemoContents(
+        yaml_config, state_dict, tokenizer_model, tokenizer_files
+    )
 
 
 def convert_weights(
@@ -177,7 +192,9 @@ def generate_config_json(yaml_config: dict) -> dict:
             "attention_bias": enc.get("use_bias", False),
             "conv_kernel_size": enc.get("conv_kernel_size", 9),
             "subsampling_factor": enc.get("subsampling_factor", 8),
-            "subsampling_conv_channels": enc.get("subsampling_conv_channels", 256),
+            "subsampling_conv_channels": enc.get(
+                "subsampling_conv_channels", 256
+            ),
             "subsampling_conv_kernel_size": 3,
             "subsampling_conv_stride": 2,
             "scale_input": True,
@@ -210,7 +227,9 @@ def convert(nemo_source: str, output_dir: Path) -> None:
         files = list_repo_files(nemo_source)
         nemo_files = [f for f in files if f.endswith(".nemo")]
         if not nemo_files:
-            raise FileNotFoundError(f"No .nemo files in {nemo_source}. Files: {files}")
+            raise FileNotFoundError(
+                f"No .nemo files in {nemo_source}. Files: {files}"
+            )
         nemo_path = Path(hf_hub_download(nemo_source, nemo_files[0]))
         print(f"Downloaded: {nemo_path}")
 
@@ -222,7 +241,9 @@ def convert(nemo_source: str, output_dir: Path) -> None:
         print(f"  {len(contents.state_dict)} weight keys")
 
         print("Converting weights...")
-        encoder_weights, decoder_joint_weights = convert_weights(contents.state_dict)
+        encoder_weights, decoder_joint_weights = convert_weights(
+            contents.state_dict
+        )
         print(f"  Encoder: {len(encoder_weights)} keys")
         print(f"  Decoder+Joint: {len(decoder_joint_weights)} keys")
 
@@ -234,7 +255,9 @@ def convert(nemo_source: str, output_dir: Path) -> None:
             json.dump(config, f, indent=2)
 
         if contents.tokenizer_model:
-            shutil.copy2(contents.tokenizer_model, output_dir / "tokenizer.model")
+            shutil.copy2(
+                contents.tokenizer_model, output_dir / "tokenizer.model"
+            )
         for tf in contents.tokenizer_files:
             if tf != contents.tokenizer_model:
                 shutil.copy2(tf, output_dir / tf.name)

@@ -71,7 +71,7 @@ def _cooperative_gemv_kernel[
         dtype,
         Layout(TDT_K),
         MutAnyOrigin,
-        address_space = AddressSpace.SHARED,
+        address_space=AddressSpace.SHARED,
     ].stack_allocation()
 
     # Cooperative load: 640 elements / 256 threads = 2.5 iterations.
