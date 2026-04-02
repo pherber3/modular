@@ -500,6 +500,38 @@ modular_py_binary(
     ],
 )
 
+filegroup(
+    name = "parakeet_kernel_sources",
+    srcs = glob(["parakeet_kernels/*.mojo"]),
+)
+
+modular_py_binary(
+    name = "bench_parakeet_gemv",
+    testonly = True,
+    srcs = ["bench_parakeet_gemv.py"],
+    data = [":parakeet_kernel_sources"],
+    imports = ["."],
+    main = "bench_parakeet_gemv.py",
+    mojo_deps = [
+        "//max:compiler",
+        "//max:layout",
+        "//max:MOGGKernelAPI",
+        "//max:tensor",
+        "@mojo//:std",
+    ],
+    tags = [
+        "gpu",
+        "no-pydeps",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/dtype",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("numpy"),
+    ],
+)
+
 modular_py_binary(
     name = "profile_decoder_step",
     testonly = True,
