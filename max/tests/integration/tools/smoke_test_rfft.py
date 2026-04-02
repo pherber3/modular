@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 
+import max.driver as md
 import torch
 import torch.utils.dlpack
 from max.dtype import DType
@@ -61,7 +62,11 @@ def main() -> None:
     print("ops.rfft smoke test")
     print("=" * 60)
 
-    session = InferenceSession()
+    devices: list[md.Device] = []
+    for i in range(md.accelerator_count()):
+        devices.append(md.Accelerator(i))
+    devices.append(md.CPU())
+    session = InferenceSession(devices=devices)
 
     cases = [
         ((5, 10, 15), 3, -1, "backward"),
