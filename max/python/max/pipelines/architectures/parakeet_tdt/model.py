@@ -31,7 +31,7 @@ import numpy.typing as npt
 from max.driver import Buffer, Device, DeviceSpec, DLPackArray, load_devices
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import Graph, TensorType
+from max.graph import DeviceRef, Graph, TensorType
 from max.graph.weights import WeightData, Weights, WeightsAdapter
 from max.nn import Linear
 from max.nn.kv_cache import KVCacheInputs
@@ -50,6 +50,7 @@ from transformers import AutoConfig, PreTrainedTokenizer
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
 from ..parakeet.encoder import ParakeetEncoder
+from ..parakeet.mel_graph import MAX_AUDIO_SAMPLES, N_FFT, build_mel_graph
 from .decoder_graph import (
     TDTGraphDecoder,
     build_decoder_step_graph,
@@ -175,6 +176,19 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             graph = build_graph(self.tdt_config, state_dict)
             timer.mark_build_complete()
             model = session.load(graph, weights_registry=state_dict)
+
+        self._mel_model: Model | None = None
+        self._cpu_device = load_devices([DeviceSpec.cpu()])[0]
+        if self.tdt_config.device != DeviceRef.CPU():
+            mel_graph = build_mel_graph(
+                n_mels=self.tdt_config.num_mel_bins,
+                max_audio_samples=MAX_AUDIO_SAMPLES,
+                periodic_window=True,
+                device=self.tdt_config.device,
+            )
+            self._mel_model = session.load(mel_graph)
+            logger.info("Loaded GPU mel extraction graph")
+
         return model
 
     def _load_decoder(
@@ -262,6 +276,23 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             input_features=Buffer.from_numpy(features).to(self.devices[0])
         )
 
+    def _prepare_audio_for_mel_graph(
+        self, audio: np.ndarray, preemphasis: float = 0.0
+    ) -> np.ndarray:
+        """Apply preemphasis, center-pad, and fit to MAX_AUDIO_SAMPLES.
+
+        Returns audio as (1, MAX_AUDIO_SAMPLES) float32 numpy array.
+        """
+        if preemphasis > 0:
+            audio = np.append(audio[0:1], audio[1:] - preemphasis * audio[:-1])
+        pad_length = N_FFT // 2
+        padded = np.pad(audio, (pad_length, pad_length), mode="constant")
+        if len(padded) < MAX_AUDIO_SAMPLES:
+            padded = np.pad(padded, (0, MAX_AUDIO_SAMPLES - len(padded)))
+        elif len(padded) > MAX_AUDIO_SAMPLES:
+            padded = padded[:MAX_AUDIO_SAMPLES]
+        return padded.reshape(1, -1).astype(np.float32)
+
     def transcribe(
         self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer
     ) -> str:
@@ -273,8 +304,18 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
                 "Please resample before sending."
             )
 
-        features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)
-        model_inputs = self.prepare_mel_input(features)
+        if self._mel_model is not None:
+            # GPU mel extraction path.
+            padded_audio = self._prepare_audio_for_mel_graph(audio)
+            audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
+            mel_buf = self._mel_model.execute(audio_buf)[0]
+            mel_np = np.from_dlpack(mel_buf.to(self._cpu_device)).copy()
+            model_inputs = self.prepare_mel_input(mel_np)
+        else:
+            # CPU fallback.
+            features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)
+            model_inputs = self.prepare_mel_input(features)
+
         token_ids_batch = self.decode(model_inputs)
         return tokenizer.decode(token_ids_batch[0], skip_special_tokens=True)
 

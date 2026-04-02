@@ -23,8 +23,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
-from max.driver import Buffer, Device
+from max.driver import Buffer, Device, DeviceSpec, load_devices
 from max.engine import InferenceSession, Model
+from max.graph import DeviceRef
 from max.graph.weights import Weights, WeightsAdapter
 from max.nn.kv_cache import KVCacheInputs
 from max.nn.transformer import ReturnLogits
@@ -43,6 +44,7 @@ from transformers import AutoConfig, PreTrainedTokenizer
 from .audio import extract_mel, normalize_per_feature, read_wav
 from .decode import ctc_greedy_decode
 from .graph import build_graph
+from .mel_graph import MAX_AUDIO_SAMPLES, N_FFT, build_mel_graph
 from .model_config import ParakeetModelConfig
 
 logger = logging.getLogger("max.pipelines")
@@ -117,6 +119,24 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
             logits, tokenizer, blank_id=self.config.blank_id
         )
 
+    def _prepare_audio_for_mel_graph(
+        self, audio: np.ndarray, preemphasis: float = 0.97
+    ) -> np.ndarray:
+        """Apply preemphasis, center-pad, and fit to MAX_AUDIO_SAMPLES.
+
+        Returns audio as (1, MAX_AUDIO_SAMPLES) float32 numpy array,
+        padded or truncated to match the compiled mel graph's fixed input.
+        """
+        if preemphasis > 0:
+            audio = np.append(audio[0:1], audio[1:] - preemphasis * audio[:-1])
+        pad_length = N_FFT // 2
+        padded = np.pad(audio, (pad_length, pad_length), mode="constant")
+        if len(padded) < MAX_AUDIO_SAMPLES:
+            padded = np.pad(padded, (0, MAX_AUDIO_SAMPLES - len(padded)))
+        elif len(padded) > MAX_AUDIO_SAMPLES:
+            padded = padded[:MAX_AUDIO_SAMPLES]
+        return padded.reshape(1, -1).astype(np.float32)
+
     def transcribe(
         self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer
     ) -> str:
@@ -128,17 +148,31 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
                 "Please resample before sending."
             )
 
-        features = extract_mel(
-            audio_data,
-            n_mels=self.config.num_mel_bins,
-            preemphasis=0.97,
-            periodic_window=False,
-        )
-        features = normalize_per_feature(features)
+        if self._mel_model is not None:
+            # GPU mel extraction path.
+            padded_audio = self._prepare_audio_for_mel_graph(audio_data)
+            audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
+            mel_buf = self._mel_model.execute(audio_buf)[0]
+            # normalize_per_feature on CPU (cheap, needs mean/std)
+            mel_np = normalize_per_feature(
+                np.from_dlpack(mel_buf.to(self._cpu_device)).copy()
+            )
+            model_inputs = ParakeetInputs(
+                input_features=Buffer.from_numpy(mel_np).to(self.devices[0])
+            )
+        else:
+            # CPU fallback.
+            features = extract_mel(
+                audio_data,
+                n_mels=self.config.num_mel_bins,
+                preemphasis=0.97,
+                periodic_window=False,
+            )
+            features = normalize_per_feature(features)
+            model_inputs = ParakeetInputs(
+                input_features=Buffer.from_numpy(features).to(self.devices[0])
+            )
 
-        model_inputs = ParakeetInputs(
-            input_features=Buffer.from_numpy(features).to(self.devices[0])
-        )
         texts = self.decode(model_inputs, tokenizer)
         return texts[0]
 
@@ -175,4 +209,17 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
             timer.mark_build_complete()
 
             model = session.load(graph, weights_registry=state_dict)
+
+        self._mel_model: Model | None = None
+        self._cpu_device = load_devices([DeviceSpec.cpu()])[0]
+        if self.config.device != DeviceRef.CPU():
+            mel_graph = build_mel_graph(
+                n_mels=self.config.num_mel_bins,
+                max_audio_samples=MAX_AUDIO_SAMPLES,
+                periodic_window=False,
+                device=self.config.device,
+            )
+            self._mel_model = session.load(mel_graph)
+            logger.info("Loaded GPU mel extraction graph")
+
         return model

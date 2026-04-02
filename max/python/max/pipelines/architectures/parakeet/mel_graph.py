@@ -32,6 +32,13 @@ HOP_LENGTH = 160
 WIN_LENGTH = 400
 LOG_EPSILON = 2**-24
 
+# Maximum mel frames the encoder accepts (matches TDTGraphDecoder.MAX_INPUT_FRAMES).
+MAX_MEL_FRAMES = 3200
+
+# Maximum audio samples after center-padding, derived from MAX_MEL_FRAMES.
+# Inverse of: n_frames = 1 + (audio_samples - N_FFT) // HOP_LENGTH
+MAX_AUDIO_SAMPLES = (MAX_MEL_FRAMES - 1) * HOP_LENGTH + N_FFT
+
 
 def _build_padded_window(periodic: bool) -> np.ndarray:
     """Build the zero-padded Hann window matching audio.py."""
@@ -116,9 +123,7 @@ def build_mel_graph(
 
         # 5. Mel filterbank: mel_basis @ power^T -> (n_mels, n_frames)
         # Then transpose to (n_frames, n_mels).
-        mel_basis_const = ops.constant(
-            mel_basis, DType.float32, device
-        )
+        mel_basis_const = ops.constant(mel_basis, DType.float32, device)
         # power is (n_frames, 257), mel_basis is (n_mels, 257)
         # matmul: (n_mels, 257) @ (257, n_frames) -> (n_mels, n_frames)
         power_t = ops.transpose(power, 0, 1)  # (257, n_frames)
