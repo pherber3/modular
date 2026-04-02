@@ -54,7 +54,6 @@ from ..parakeet.mel_graph import MAX_AUDIO_SAMPLES, N_FFT, build_mel_graph
 from .decoder_graph import (
     TDTGraphDecoder,
     build_decoder_step_graph,
-    build_mojo_decoder_step_graph,
     convert_decoder_state_dict,
 )
 from .model_config import TDTModelConfig
@@ -198,35 +197,16 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
         pred_dict: dict[str, np.ndarray],
         joint_dict: dict[str, np.ndarray],
     ) -> None:
-        """Compile the decoder step graph.
-
-        Uses the fused Mojo GPU kernel on GPU devices for lower per-step
-        latency (~47µs vs ~80µs for the standard graph). Falls back to
-        the standard graph on CPU.
-        """
-        use_mojo = self.tdt_config.device != DeviceRef.CPU()
-        dec_weights = {**pred_dict, **joint_dict}
-
-        if use_mojo:
-            with CompilationTimer("TDT-MojoDecoderStep") as timer:
-                dec_graph = build_mojo_decoder_step_graph(
-                    self.tdt_config, pred_dict, joint_dict
-                )
-                timer.mark_build_complete()
-                decoder_step_model = session.load(
-                    dec_graph, weights_registry=dec_weights
-                )
-            label = "Mojo fused kernel"
-        else:
-            with CompilationTimer("TDT-DecoderStep") as timer:
-                dec_graph = build_decoder_step_graph(
-                    self.tdt_config, pred_dict, joint_dict
-                )
-                timer.mark_build_complete()
-                decoder_step_model = session.load(
-                    dec_graph, weights_registry=dec_weights
-                )
-            label = "MAX graph"
+        """Compile the decoder step graph."""
+        with CompilationTimer("TDT-DecoderStep") as timer:
+            dec_graph = build_decoder_step_graph(
+                self.tdt_config, pred_dict, joint_dict
+            )
+            timer.mark_build_complete()
+            dec_weights = {**pred_dict, **joint_dict}
+            decoder_step_model = session.load(
+                dec_graph, weights_registry=dec_weights
+            )
 
         cpu_device = load_devices([DeviceSpec.cpu()])[0]
 
@@ -237,8 +217,8 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             cpu_device=cpu_device,
         )
         logger.info(
-            "Loaded TDT decoder (%s, device=%s): decoder step compiled",
-            label,
+            "Loaded TDT decoder (MAX graph, device=%s): "
+            "decoder step graph compiled",
             self.tdt_config.device,
         )
 

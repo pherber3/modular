@@ -481,13 +481,6 @@ modular_py_binary(
     srcs = ["benchmark_parakeet.py"],
     imports = ["."],
     main = "benchmark_parakeet.py",
-    mojo_deps = [
-        "//max:compiler",
-        "//max:layout",
-        "//max:MOGGKernelAPI",
-        "//max:tensor",
-        "@mojo//:std",
-    ],
     tags = [
         "no-pydeps",
         "requires-network",
