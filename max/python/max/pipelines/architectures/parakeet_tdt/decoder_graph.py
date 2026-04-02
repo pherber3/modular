@@ -158,27 +158,21 @@ class PredictionNetworkGraph(Module):
     def __call__(
         self,
         token_id: TensorValue,
-        h0: TensorValue,
-        c0: TensorValue,
-        h1: TensorValue,
-        c1: TensorValue,
-    ) -> tuple[
-        TensorValue,
-        TensorValue,
-        TensorValue,
-        TensorValue,
-        TensorValue,
-    ]:
-        """Run one prediction step.
+        lstm_state_packed: TensorValue,
+    ) -> tuple[TensorValue, TensorValue]:
+        """Run one prediction step with packed LSTM states.
 
         Args:
             token_id: Previous token ID, shape ``(1, 1)`` int32.
-            h0, c0: LSTM layer 0 states, shape ``(1, 640)``.
-            h1, c1: LSTM layer 1 states, shape ``(1, 640)``.
+            lstm_state_packed: All LSTM states packed as ``(1, 4*pred_hidden)``,
+                order: ``[h0, c0, h1, c1]``.
 
         Returns:
-            ``(pred_out, h0', c0', h1', c1')``
+            ``(pred_out, lstm_state_packed_new)``
         """
+        # Unpack LSTM states: (1, 2560) → 4 x (1, 640)
+        h0, c0, h1, c1 = ops.chunk(lstm_state_packed, 4, axis=-1)
+
         # Embedding lookup: (1, 1) → (1, 640)
         x = ops.gather(self.embedding, token_id, axis=0)
         # gather output shape is (1, 1, 640), squeeze the middle dim
@@ -190,8 +184,13 @@ class PredictionNetworkGraph(Module):
         # LSTM layer 1 (input is output of layer 0)
         h1_new, c1_new = self.lstm_1(h0_new, h1, c1)
 
+        # Repack LSTM states: 4 x (1, 640) → (1, 2560)
+        lstm_state_packed_new = ops.concat(
+            [h0_new, c0_new, h1_new, c1_new], axis=-1
+        )
+
         # Predictor output is the hidden state of the last layer
-        return h1_new, h0_new, c0_new, h1_new, c1_new
+        return h1_new, lstm_state_packed_new
 
 
 # ---------------------------------------------------------------------------
@@ -274,8 +273,8 @@ def build_decoder_step_graph(
             (keys relative to joint module).
 
     Returns:
-        Compiled graph with 7 inputs and 6 outputs
-        (best_token, best_dur_idx, h0', c0', h1', c1').
+        Compiled graph with 4 inputs and 2 outputs
+        (decisions, lstm_state_packed).
     """
     pred_hidden = config.pred_hidden
     joint_hidden = config.joint_hidden
@@ -285,13 +284,12 @@ def build_decoder_step_graph(
     device = config.device
     max_encoder_len = TDTGraphDecoder.MAX_ENCODER_FRAMES
 
-    # 7 inputs: token_id, h0, c0, h1, c1, enc_projected, t_index
+    # 4 inputs: token_id, lstm_state_packed, enc_projected, t_index
     input_types = [
         TensorType(DType.int32, shape=[1, 1], device=device),  # token_id
-        TensorType(DType.float32, shape=[1, pred_hidden], device=device),  # h0
-        TensorType(DType.float32, shape=[1, pred_hidden], device=device),  # c0
-        TensorType(DType.float32, shape=[1, pred_hidden], device=device),  # h1
-        TensorType(DType.float32, shape=[1, pred_hidden], device=device),  # c1
+        TensorType(
+            DType.float32, shape=[1, 4 * pred_hidden], device=device
+        ),  # lstm_state_packed [h0, c0, h1, c1]
         TensorType(
             DType.float32,
             shape=[1, max_encoder_len, joint_hidden],
@@ -323,12 +321,9 @@ def build_decoder_step_graph(
 
         # Wire up inputs
         token_id = graph.inputs[0].tensor
-        h0 = graph.inputs[1].tensor
-        c0 = graph.inputs[2].tensor
-        h1 = graph.inputs[3].tensor
-        c1 = graph.inputs[4].tensor
-        enc_projected = graph.inputs[5].tensor  # (1, 400, 640)
-        t_index = graph.inputs[6].tensor  # (1,)
+        lstm_state_packed = graph.inputs[1].tensor
+        enc_projected = graph.inputs[2].tensor  # (1, 400, 640)
+        t_index = graph.inputs[3].tensor  # (1,)
 
         # Slice encoder at timestep t on-device: (1, 400, 640) → (1, 640)
         enc_t = ops.gather(enc_projected, t_index, axis=1)
@@ -336,8 +331,8 @@ def build_decoder_step_graph(
         enc_t = ops.squeeze(enc_t, 1)
 
         # Forward pass
-        pred_out, h0_new, c0_new, h1_new, c1_new = prediction(
-            token_id, h0, c0, h1, c1
+        pred_out, lstm_state_packed_new = prediction(
+            token_id, lstm_state_packed
         )
         logits = joint(enc_t, pred_out)  # (1, output_size)
 
@@ -362,7 +357,7 @@ def build_decoder_step_graph(
             axis=-1,
         )  # (1, 2) int32
 
-        graph.output(decisions, h0_new, c0_new, h1_new, c1_new)
+        graph.output(decisions, lstm_state_packed_new)
 
     return graph
 
@@ -489,11 +484,12 @@ class TDTGraphDecoder:
             for tid in range(num_tokens)
         ]
 
-        # Double-buffered LSTM states for CUDA graph capture.
-        # Set A and Set B alternate as input/output each step,
-        # eliminating 4x inplace_copy_from per step.
-        # Each set: [token_input, h0, c0, h1, c1, t_input]
-        zero = np.zeros((1, config.pred_hidden), dtype=np.float32)
+        # Double-buffered packed LSTM states for CUDA graph capture.
+        # Set A and Set B alternate as input/output each step.
+        # Packing [h0, c0, h1, c1] into (1, 4*pred_hidden) reduces
+        # per-step inplace_copy_from from 4 calls to 1.
+        packed_size = 4 * config.pred_hidden
+        zero_packed = np.zeros((1, packed_size), dtype=np.float32)
         blank_token = np.array([[config.blank_id]], dtype=np.int32)
         t_zero = np.array([0], dtype=np.int32)
 
@@ -502,16 +498,15 @@ class TDTGraphDecoder:
             self._bufs.append(
                 {
                     "token": Buffer.from_numpy(blank_token.copy()).to(device),
-                    "h0": Buffer.from_numpy(zero.copy()).to(device),
-                    "c0": Buffer.from_numpy(zero.copy()).to(device),
-                    "h1": Buffer.from_numpy(zero.copy()).to(device),
-                    "c1": Buffer.from_numpy(zero.copy()).to(device),
+                    "lstm_packed": Buffer.from_numpy(zero_packed.copy()).to(
+                        device
+                    ),
                     "t": Buffer.from_numpy(t_zero.copy()).to(device),
                 }
             )
 
-        # Pre-allocated zero buffer for resetting LSTM states per utterance.
-        self._zero_buf = Buffer.from_numpy(zero.copy()).to(device)
+        # Pre-allocated zero buffer for resetting packed LSTM states.
+        self._zero_buf = Buffer.from_numpy(zero_packed.copy()).to(device)
 
         # Pinned buffer for async D2H readback of decisions.
         self._decisions_pinned = DevicePinnedBuffer(
@@ -531,35 +526,23 @@ class TDTGraphDecoder:
 
         Graph 0: set A as input → set B as output
         Graph 1: set B as input → set A as output
-        This eliminates all LSTM state copies between steps.
         """
         self._enc_proj_buf = enc_projected.copy()
         self._enc_proj_buf.inplace_copy_from(enc_projected)
 
-        zero = Buffer.from_numpy(
-            np.zeros((1, self.pred_hidden), dtype=np.float32)
-        ).to(self.device)
-
         for i in range(2):
             buf = self._bufs[i]
-            buf["h0"].inplace_copy_from(zero)
-            buf["c0"].inplace_copy_from(zero)
-            buf["h1"].inplace_copy_from(zero)
-            buf["c1"].inplace_copy_from(zero)
+            buf["lstm_packed"].inplace_copy_from(self._zero_buf)
             buf["token"].inplace_copy_from(self._token_bufs[self.blank_id])
             buf["t"].inplace_copy_from(self._t_index_bufs[0])
 
-        # Capture graph 0: input=set[0], output→set[1] state buffers
         for idx in range(2):
             inp = self._bufs[idx]
             self._captured_outputs[idx] = list(
                 self.decoder_step_model.capture(
                     self._graph_keys[idx],
                     inp["token"],
-                    inp["h0"],
-                    inp["c0"],
-                    inp["h1"],
-                    inp["c1"],
+                    inp["lstm_packed"],
                     self._enc_proj_buf,
                     inp["t"],
                 )
@@ -572,9 +555,8 @@ class TDTGraphDecoder:
         """Run TDT greedy decode with double-buffered CUDA graph replay.
 
         Two graphs alternate: step N replays graph 0 (set A→B), step N+1
-        replays graph 1 (set B→A). The captured output buffers of graph 0
-        ARE the input buffers of graph 1, so LSTM states flow without any
-        copies. Only token and t_index need in-place updates.
+        replays graph 1 (set B→A). Packed LSTM states reduce per-step
+        inplace_copy_from from 4 calls to 1.
 
         Args:
             enc_projected: Pre-projected encoder output on GPU,
@@ -591,46 +573,40 @@ class TDTGraphDecoder:
             assert self._enc_proj_buf is not None
             self._enc_proj_buf.inplace_copy_from(enc_projected)
 
-        # Reset LSTM states to zero for both buffer sets.
+        # Hoist attribute lookups to locals for hot-loop performance.
+        bufs = self._bufs
+        token_bufs = self._token_bufs
+        t_index_bufs = self._t_index_bufs
+        enc_proj_buf = self._enc_proj_buf
+        graph_keys = self._graph_keys
+        captured_outputs = self._captured_outputs
+        decisions_pinned = self._decisions_pinned
+        decisions_np = self._decisions_np
+        zero_buf = self._zero_buf
+        blank_id = self.blank_id
+        durations = self.durations
+        replay = self.decoder_step_model.replay
+
+        # Reset packed LSTM states to zero for both buffer sets.
         for i in range(2):
-            self._bufs[i]["h0"].inplace_copy_from(self._zero_buf)
-            self._bufs[i]["c0"].inplace_copy_from(self._zero_buf)
-            self._bufs[i]["h1"].inplace_copy_from(self._zero_buf)
-            self._bufs[i]["c1"].inplace_copy_from(self._zero_buf)
+            bufs[i]["lstm_packed"].inplace_copy_from(zero_buf)
 
         # SOS step: replay graph 0 with blank token at t=0.
-        cur = 0  # Current buffer set index (input side)
-        self._bufs[cur]["token"].inplace_copy_from(
-            self._token_bufs[self.blank_id]
+        cur = 0
+        bufs[cur]["token"].inplace_copy_from(token_bufs[blank_id])
+        bufs[cur]["t"].inplace_copy_from(t_index_bufs[0])
+        replay(
+            graph_keys[cur],
+            bufs[cur]["token"],
+            bufs[cur]["lstm_packed"],
+            enc_proj_buf,
+            bufs[cur]["t"],
         )
-        self._bufs[cur]["t"].inplace_copy_from(self._t_index_bufs[0])
-        self.decoder_step_model.replay(
-            self._graph_keys[cur],
-            self._bufs[cur]["token"],
-            self._bufs[cur]["h0"],
-            self._bufs[cur]["c0"],
-            self._bufs[cur]["h1"],
-            self._bufs[cur]["c1"],
-            self._enc_proj_buf,
-            self._bufs[cur]["t"],
-        )
-        # Output LSTM states are now in captured_outputs[cur],
-        # which ARE the input buffers of the OTHER set if we captured
-        # correctly. But capture doesn't guarantee output buffers
-        # alias the other set's inputs. So the double-buffer trick
-        # only works if we manually wire it — which we can't with
-        # MAX's capture API (outputs are allocated by the runtime).
-        #
-        # Fallback: copy output states to the next set's input buffers.
-        # This is still only 4 GPU→GPU copies, same as before, but
-        # the CUDA graph replay itself is faster.
+        # Copy packed LSTM state output to next set's input buffer.
         nxt = 1 - cur
-        outs = self._captured_outputs[cur]
-        # outs: [decisions, h0, c0, h1, c1]
-        self._bufs[nxt]["h0"].inplace_copy_from(outs[1])
-        self._bufs[nxt]["c0"].inplace_copy_from(outs[2])
-        self._bufs[nxt]["h1"].inplace_copy_from(outs[3])
-        self._bufs[nxt]["c1"].inplace_copy_from(outs[4])
+        outs = captured_outputs[cur]
+        # outs: [decisions, lstm_state_packed]
+        bufs[nxt]["lstm_packed"].inplace_copy_from(outs[1])
         cur = nxt
 
         # Greedy decode loop.
@@ -642,49 +618,33 @@ class TDTGraphDecoder:
             symbols_at_t = 0
 
             while symbols_at_t < max_symbols_per_step:
-                # Update time index on current input set.
-                self._bufs[cur]["t"].inplace_copy_from(self._t_index_bufs[t])
+                bufs[cur]["t"].inplace_copy_from(t_index_bufs[t])
 
-                # Replay current graph.
-                self.decoder_step_model.replay(
-                    self._graph_keys[cur],
-                    self._bufs[cur]["token"],
-                    self._bufs[cur]["h0"],
-                    self._bufs[cur]["c0"],
-                    self._bufs[cur]["h1"],
-                    self._bufs[cur]["c1"],
-                    self._enc_proj_buf,
-                    self._bufs[cur]["t"],
+                replay(
+                    graph_keys[cur],
+                    bufs[cur]["token"],
+                    bufs[cur]["lstm_packed"],
+                    enc_proj_buf,
+                    bufs[cur]["t"],
                 )
 
-                # Async D2H: copy decisions to pinned buffer, record event.
-                outs = self._captured_outputs[cur]
-                decisions_dev = outs[0]
-                self._decisions_pinned.inplace_copy_from(decisions_dev)
+                outs = captured_outputs[cur]
+                decisions_pinned.inplace_copy_from(outs[0])
 
-                # Copy LSTM states to next set's input buffers.
                 nxt = 1 - cur
-                self._bufs[nxt]["h0"].inplace_copy_from(outs[1])
-                self._bufs[nxt]["c0"].inplace_copy_from(outs[2])
-                self._bufs[nxt]["h1"].inplace_copy_from(outs[3])
-                self._bufs[nxt]["c1"].inplace_copy_from(outs[4])
+                bufs[nxt]["lstm_packed"].inplace_copy_from(outs[1])
 
-                # Read decisions from pinned buffer (already on host).
-                decisions = self._decisions_np
-                token = int(decisions[0])
-                dur_idx = int(decisions[1])
-                duration = self.durations[dur_idx]
+                token = int(decisions_np[0])
+                dur_idx = int(decisions_np[1])
+                duration = durations[dur_idx]
 
-                if token == self.blank_id:
+                if token == blank_id:
                     cur = nxt
                     t += max(duration, 1)
                     break
 
-                # Non-blank: update next set's token buffer.
                 tokens.append(token)
-                self._bufs[nxt]["token"].inplace_copy_from(
-                    self._token_bufs[token]
-                )
+                bufs[nxt]["token"].inplace_copy_from(token_bufs[token])
                 cur = nxt
                 symbols_at_t += 1
 
