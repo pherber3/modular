@@ -458,6 +458,23 @@ modular_py_binary(
 )
 
 modular_py_binary(
+    name = "smoke_test_rfft",
+    testonly = True,
+    srcs = ["smoke_test_rfft.py"],
+    imports = ["."],
+    main = "smoke_test_rfft.py",
+    tags = [
+        "no-pydeps",
+    ],
+    deps = [
+        "//max/python/max/driver",
+        "//max/python/max/engine",
+        "//max/python/max/graph",
+        requirement("torch"),
+    ],
+)
+
+modular_py_binary(
     name = "benchmark_parakeet",
     testonly = True,
     srcs = ["benchmark_parakeet.py"],
