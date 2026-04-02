@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 from huggingface_hub import hf_hub_download
-from max.driver import Accelerator, Buffer, Device, accelerator_count
+from max.driver import CPU, Accelerator, Buffer, Device, accelerator_count
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
@@ -64,6 +64,8 @@ def load_weights() -> dict[str, NDFloat]:
         "pred_b": raw["joint.pred.bias"],
         "out_w": raw["joint.joint_net.2.weight"],
         "out_b": raw["joint.joint_net.2.bias"],
+        "enc_w": raw["joint.enc.weight"],
+        "enc_b": raw["joint.enc.bias"],
     }
 
 
@@ -124,13 +126,15 @@ def build_graph(device: Device, weights: dict[str, NDFloat]) -> Graph:
 def prepare_buffers(
     device: Device, weights: dict[str, NDFloat]
 ) -> list[Buffer]:
-    rng = np.random.default_rng(42)
-    enc = (
-        rng.standard_normal((1, MAX_ENCODER_FRAMES, JOINT_HIDDEN)).astype(
-            np.float32
-        )
-        * 0.5
+    rng = np.random.default_rng(456)
+    encoder_hidden = 1024
+    raw_enc = rng.standard_normal((MAX_ENCODER_FRAMES, encoder_hidden)).astype(
+        np.float32
     )
+    enc_proj = (raw_enc @ weights["enc_w"].T + weights["enc_b"]).astype(
+        np.float32
+    )
+    enc = enc_proj.reshape(1, MAX_ENCODER_FRAMES, JOINT_HIDDEN)
 
     bufs = [
         Buffer.from_numpy(enc),
@@ -189,19 +193,19 @@ def main() -> None:
     for _ in range(WARMUP):
         model.execute(*bufs)
 
-    # Benchmark
+    # Benchmark (force GPU sync by reading output_count to CPU each iteration)
     times: list[float] = []
     for _ in range(ITERS):
         t0 = time.perf_counter()
         results = model.execute(*bufs)
+        # Force GPU synchronization — without this, execute() returns async
+        count_buf = results[1]
+        assert isinstance(count_buf, Buffer)
+        _ = count_buf.to(CPU())
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1e3)  # ms
 
     # Get token count from last run
-    from max.driver import CPU
-
-    count_buf = results[1]
-    assert isinstance(count_buf, Buffer)
     count = int(count_buf.to(CPU()).to_numpy()[0])
 
     median = sorted(times)[len(times) // 2]

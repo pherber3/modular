@@ -282,11 +282,19 @@ def prepare_buffers(
     return [b.to(device) for b in bufs]
 
 
-def make_synthetic_enc_projected(T: int, seed: int = 42) -> NDFloat:
-    """Generate synthetic pre-projected encoder output."""
+def make_synthetic_enc_projected(
+    T: int, weights: dict[str, NDFloat], seed: int = 42
+) -> NDFloat:
+    """Generate synthetic pre-projected encoder output.
+
+    Simulates the real pipeline: random encoder hidden states (1024-dim)
+    projected through joint.enc.weight + joint.enc.bias to get (T, 640).
+    This produces values in the right distribution to trigger non-blank tokens.
+    """
     rng = np.random.default_rng(seed)
-    # Use small values to get realistic-ish decoder behavior
-    return rng.standard_normal((T, JOINT_HIDDEN)).astype(np.float32) * 0.5
+    encoder_hidden = 1024
+    raw_enc = rng.standard_normal((T, encoder_hidden)).astype(np.float32)
+    return (raw_enc @ weights["enc_w"].T + weights["enc_b"]).astype(np.float32)
 
 
 def run_test(
@@ -362,25 +370,25 @@ def main() -> None:
     all_passed = True
 
     # Test 1: Synthetic encoder output, T=50 (short)
-    enc_50 = make_synthetic_enc_projected(50, seed=42)
+    enc_50 = make_synthetic_enc_projected(50, weights, seed=42)
     all_passed &= run_test(
         "Test 1: synthetic T=50", model, device, enc_50, weights
     )
 
     # Test 2: Synthetic encoder output, T=200 (medium)
-    enc_200 = make_synthetic_enc_projected(200, seed=123)
+    enc_200 = make_synthetic_enc_projected(200, weights, seed=123)
     all_passed &= run_test(
         "Test 2: synthetic T=200", model, device, enc_200, weights
     )
 
     # Test 3: Synthetic encoder output, T=400 (max)
-    enc_400 = make_synthetic_enc_projected(400, seed=456)
+    enc_400 = make_synthetic_enc_projected(400, weights, seed=456)
     all_passed &= run_test(
         "Test 3: synthetic T=400 (max)", model, device, enc_400, weights
     )
 
     # Test 4: Very short, T=1
-    enc_1 = make_synthetic_enc_projected(1, seed=789)
+    enc_1 = make_synthetic_enc_projected(1, weights, seed=789)
     all_passed &= run_test(
         "Test 4: synthetic T=1 (edge case)", model, device, enc_1, weights
     )
