@@ -305,12 +305,11 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             )
 
         if self._mel_model is not None:
-            # GPU mel extraction path.
+            # GPU mel extraction path — features stay on device.
             padded_audio = self._prepare_audio_for_mel_graph(audio)
             audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
             mel_buf = self._mel_model.execute(audio_buf)[0]
-            mel_np = np.from_dlpack(mel_buf.to(self._cpu_device)).copy()
-            model_inputs = self.prepare_mel_input(mel_np)
+            model_inputs = ParakeetTDTInputs(input_features=mel_buf)
         else:
             # CPU fallback.
             features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)

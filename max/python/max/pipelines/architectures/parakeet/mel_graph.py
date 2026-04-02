@@ -68,6 +68,7 @@ def build_mel_graph(
     max_audio_samples: int,
     periodic_window: bool,
     device: DeviceRef,
+    normalize: bool = True,
 ) -> Graph:
     """Build a MAX graph for GPU mel spectrogram extraction.
 
@@ -135,6 +136,14 @@ def build_mel_graph(
 
         # Reshape to (1, n_frames, n_mels) to match encoder input.
         log_mel = log_mel.reshape((1, n_frames, n_mels))
+
+        if normalize:
+            # Per-feature normalization on GPU: (x - mean) / (std + 1e-5)
+            # ops.mean/sum keep dims, so mean is (1, 1, n_mels).
+            mean = ops.mean(log_mel, axis=1)  # (1, 1, n_mels)
+            diff = log_mel - mean
+            var = ops.mean(diff * diff, axis=1)  # (1, 1, n_mels)
+            log_mel = diff * ops.rsqrt(var + 1e-5)
 
         graph.output(log_mel)
 

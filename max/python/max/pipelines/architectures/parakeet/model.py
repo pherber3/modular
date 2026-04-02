@@ -149,17 +149,11 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
             )
 
         if self._mel_model is not None:
-            # GPU mel extraction path.
+            # GPU mel extraction path — features stay on device.
             padded_audio = self._prepare_audio_for_mel_graph(audio_data)
             audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
             mel_buf = self._mel_model.execute(audio_buf)[0]
-            # normalize_per_feature on CPU (cheap, needs mean/std)
-            mel_np = normalize_per_feature(
-                np.from_dlpack(mel_buf.to(self._cpu_device)).copy()
-            )
-            model_inputs = ParakeetInputs(
-                input_features=Buffer.from_numpy(mel_np).to(self.devices[0])
-            )
+            model_inputs = ParakeetInputs(input_features=mel_buf)
         else:
             # CPU fallback.
             features = extract_mel(

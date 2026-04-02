@@ -561,30 +561,12 @@ def bench_full_pipeline(
                 t0 = time.perf_counter()
                 audio_buf = Buffer.from_numpy(audio_input).to(devices[0])
                 assert mel_model is not None
-                mel_buf = mel_model.execute(audio_buf)[0]
-                # normalize on CPU (needs mean/std)
-                features = normalize_per_feature(
-                    np.from_dlpack(mel_buf.to(cpu_dev)).copy()
-                ).astype(np.float32)
-                max_frames = 3200
-                if features.shape[1] < max_frames:
-                    pad_width = [
-                        (0, 0),
-                        (0, max_frames - features.shape[1]),
-                        (0, 0),
-                    ]
-                    features = np.pad(features, pad_width)
-                elif features.shape[1] > max_frames:
-                    features = features[:, :max_frames, :]
+                buf = mel_model.execute(audio_buf)[0]
+                # Normalization is fused into the mel graph — no D2H round-trip.
                 t1 = time.perf_counter()
                 if record:
                     r_norm.times_ms.append((t1 - t0) * 1000)
-
-                t0 = time.perf_counter()
-                buf = Buffer.from_numpy(features).to(devices[0])
-                t1 = time.perf_counter()
-                if record:
-                    r_buffer.times_ms.append((t1 - t0) * 1000)
+                    r_buffer.times_ms.append(0.0)
             else:
                 # CPU mel path (original).
                 t0 = time.perf_counter()
