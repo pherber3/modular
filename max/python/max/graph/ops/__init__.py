@@ -77,6 +77,7 @@ from .pooling import avg_pool2d, max_pool2d
 from .quantized import dequantize, qmatmul
 from .range import range
 from .rebind import rebind
+from .rfft import rfft
 from .reduction import argmax, argmin, mean, prod, sum
 from .reduction import max as _reduce_max
 from .reduction import min as _reduce_min
