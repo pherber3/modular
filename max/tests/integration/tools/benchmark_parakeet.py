@@ -507,8 +507,21 @@ def bench_full_pipeline(
 
         if model_type == "ctc":
             n_mels = ctc_model.config.num_mel_bins
+            mel_model = ctc_model._mel_model
         else:
             n_mels = tdt_model.tdt_config.num_mel_bins
+            mel_model = tdt_model._mel_model
+
+        use_gpu_mel = mel_model is not None and device != "cpu"
+        if use_gpu_mel:
+            from max.pipelines.architectures.parakeet.mel_graph import (
+                MAX_AUDIO_SAMPLES,
+                N_FFT,
+            )
+
+            print(
+                f"  Using GPU mel extraction (MAX_AUDIO_SAMPLES={MAX_AUDIO_SAMPLES})"
+            )
 
         cpu_dev = load_devices([DeviceSpec.cpu()])[0]
 
@@ -525,39 +538,87 @@ def bench_full_pipeline(
             if record:
                 r_wav.times_ms.append((t1 - t0) * 1000)
 
-            t0 = time.perf_counter()
-            features = extract_mel(
-                audio,
-                n_mels=n_mels,
-                preemphasis=preemphasis,
-                periodic_window=periodic,
-            )
-            t1 = time.perf_counter()
-            if record:
-                r_mel.times_ms.append((t1 - t0) * 1000)
+            if use_gpu_mel:
+                # GPU mel path: preemphasis + pad in numpy, then mel graph on GPU.
+                t0 = time.perf_counter()
+                if preemphasis > 0:
+                    audio = np.append(
+                        audio[0:1], audio[1:] - preemphasis * audio[:-1]
+                    )
+                pad_len = N_FFT // 2
+                padded = np.pad(audio, (pad_len, pad_len), mode="constant")
+                if len(padded) < MAX_AUDIO_SAMPLES:
+                    padded = np.pad(
+                        padded, (0, MAX_AUDIO_SAMPLES - len(padded))
+                    )
+                elif len(padded) > MAX_AUDIO_SAMPLES:
+                    padded = padded[:MAX_AUDIO_SAMPLES]
+                audio_input = padded.reshape(1, -1).astype(np.float32)
+                t1 = time.perf_counter()
+                if record:
+                    r_mel.times_ms.append((t1 - t0) * 1000)
 
-            t0 = time.perf_counter()
-            features = normalize_per_feature(features).astype(np.float32)
-            # Pad or truncate to fixed 3200 frames for GPU compatibility.
-            max_frames = 3200
-            if features.shape[1] < max_frames:
-                pad_width = [
-                    (0, 0),
-                    (0, max_frames - features.shape[1]),
-                    (0, 0),
-                ]
-                features = np.pad(features, pad_width)
-            elif features.shape[1] > max_frames:
-                features = features[:, :max_frames, :]
-            t1 = time.perf_counter()
-            if record:
-                r_norm.times_ms.append((t1 - t0) * 1000)
+                t0 = time.perf_counter()
+                audio_buf = Buffer.from_numpy(audio_input).to(devices[0])
+                assert mel_model is not None
+                mel_buf = mel_model.execute(audio_buf)[0]
+                # normalize on CPU (needs mean/std)
+                features = normalize_per_feature(
+                    np.from_dlpack(mel_buf.to(cpu_dev)).copy()
+                ).astype(np.float32)
+                max_frames = 3200
+                if features.shape[1] < max_frames:
+                    pad_width = [
+                        (0, 0),
+                        (0, max_frames - features.shape[1]),
+                        (0, 0),
+                    ]
+                    features = np.pad(features, pad_width)
+                elif features.shape[1] > max_frames:
+                    features = features[:, :max_frames, :]
+                t1 = time.perf_counter()
+                if record:
+                    r_norm.times_ms.append((t1 - t0) * 1000)
 
-            t0 = time.perf_counter()
-            buf = Buffer.from_numpy(features).to(devices[0])
-            t1 = time.perf_counter()
-            if record:
-                r_buffer.times_ms.append((t1 - t0) * 1000)
+                t0 = time.perf_counter()
+                buf = Buffer.from_numpy(features).to(devices[0])
+                t1 = time.perf_counter()
+                if record:
+                    r_buffer.times_ms.append((t1 - t0) * 1000)
+            else:
+                # CPU mel path (original).
+                t0 = time.perf_counter()
+                features = extract_mel(
+                    audio,
+                    n_mels=n_mels,
+                    preemphasis=preemphasis,
+                    periodic_window=periodic,
+                )
+                t1 = time.perf_counter()
+                if record:
+                    r_mel.times_ms.append((t1 - t0) * 1000)
+
+                t0 = time.perf_counter()
+                features = normalize_per_feature(features).astype(np.float32)
+                max_frames = 3200
+                if features.shape[1] < max_frames:
+                    pad_width = [
+                        (0, 0),
+                        (0, max_frames - features.shape[1]),
+                        (0, 0),
+                    ]
+                    features = np.pad(features, pad_width)
+                elif features.shape[1] > max_frames:
+                    features = features[:, :max_frames, :]
+                t1 = time.perf_counter()
+                if record:
+                    r_norm.times_ms.append((t1 - t0) * 1000)
+
+                t0 = time.perf_counter()
+                buf = Buffer.from_numpy(features).to(devices[0])
+                t1 = time.perf_counter()
+                if record:
+                    r_buffer.times_ms.append((t1 - t0) * 1000)
 
             t0 = time.perf_counter()
             if model_type == "ctc":
