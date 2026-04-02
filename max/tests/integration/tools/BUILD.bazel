@@ -470,7 +470,7 @@ modular_py_binary(
         "//max/python/max/driver",
         "//max/python/max/engine",
         "//max/python/max/graph",
-        requirement("torch"),
+        requirement("numpy"),
     ],
 )
 

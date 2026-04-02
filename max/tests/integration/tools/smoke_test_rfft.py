@@ -10,28 +10,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
-"""Smoke test for ops.rfft on GPU — compare MAX vs torch.fft.rfft."""
+"""Smoke test for ops.rfft on GPU — compare MAX vs numpy.fft.rfft.
+
+Uses numpy for reference since Bazel bundles CPU-only torch.
+"""
 
 from __future__ import annotations
 
 import sys
 
 import max.driver as md
-import torch
-import torch.utils.dlpack
+import numpy as np
+from max.driver import Buffer
 from max.dtype import DType
 from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType, ops
 
 
+def numpy_rfft(
+    x: np.ndarray, n: int | None, axis: int, normalization: str
+) -> np.ndarray:
+    """Compute rfft with numpy and return as interleaved real/imag."""
+    result = np.fft.rfft(x, n=n, axis=axis, norm=normalization)  # type: ignore[arg-type]
+    # Normalize axis, then insert complex dim (size 2) right after it.
+    norm_axis = axis % x.ndim
+    return np.stack(
+        [result.real, result.imag], axis=norm_axis + 1
+    ).astype(np.float32)
+
+
 def test_rfft(
     session: InferenceSession,
+    gpu: md.Device,
     input_shape: tuple[int, ...],
     n: int | None,
     axis: int,
     normalization: str,
 ) -> bool:
-    x = torch.randn(*input_shape, dtype=torch.float32).to("cuda")
+    x = np.random.randn(*input_shape).astype(np.float32)
 
     with Graph(
         "rfft",
@@ -43,18 +59,21 @@ def test_rfft(
         graph.output(out)
 
     model = session.load(graph)
-    max_out = torch.utils.dlpack.from_dlpack(model(x)[0])
+    x_gpu = Buffer.from_numpy(x).to(gpu)
+    result_gpu = model(x_gpu)[0]
+    result_cpu = result_gpu.to(md.CPU())
+    max_out = np.from_dlpack(result_cpu).copy()
 
-    torch_out = torch.view_as_real(
-        torch.fft.rfft(x, n=n, dim=axis, norm=normalization)
-    )
+    np_out = numpy_rfft(x, n, axis, normalization)
 
-    match = torch.allclose(max_out, torch_out, rtol=1e-5, atol=1e-5)
-    max_diff = (max_out - torch_out).abs().max().item()
+    max_diff = np.abs(max_out - np_out).max()
+    match = max_diff < 1e-4
 
     label = f"shape={input_shape}, n={n}, axis={axis}, norm={normalization}"
     status = "PASS" if match else "FAIL"
     print(f"  [{status}] {label}  (max_diff={max_diff:.2e})")
+    if not match:
+        print(f"    MAX shape={max_out.shape}, numpy shape={np_out.shape}")
     return match
 
 
@@ -63,10 +82,20 @@ def main() -> None:
     print("=" * 60)
 
     devices: list[md.Device] = []
+    gpu = None
     for i in range(md.accelerator_count()):
-        devices.append(md.Accelerator(i))
+        dev = md.Accelerator(i)
+        devices.append(dev)
+        if gpu is None:
+            gpu = dev
     devices.append(md.CPU())
     session = InferenceSession(devices=devices)
+    print(f"Devices: {devices}")
+
+    if gpu is None:
+        print("ERROR: No GPU available")
+        sys.exit(1)
+    print()
 
     cases = [
         ((5, 10, 15), 3, -1, "backward"),
@@ -79,7 +108,7 @@ def main() -> None:
 
     all_pass = True
     for input_shape, n, axis, norm in cases:
-        if not test_rfft(session, input_shape, n, axis, norm):
+        if not test_rfft(session, gpu, input_shape, n, axis, norm):
             all_pass = False
 
     print("=" * 60)
