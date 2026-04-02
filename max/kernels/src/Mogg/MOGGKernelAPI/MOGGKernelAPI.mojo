@@ -174,6 +174,7 @@ from nn.index_tensor import (
     index_tensor,
 )
 from nn.irfft import irfft
+from nn.rfft import rfft
 from kv_cache.lmcache_transfer import lmcache_offload, lmcache_onload
 from nn.kv_cache import (
     copy_kv_pages_d2h,
@@ -5177,6 +5178,31 @@ struct IRFFT:
         comptime assert is_gpu[target](), "only valid on GPUs"
 
         irfft(
+            input.to_tile_tensor[DType.int64](),
+            output.to_tile_tensor[DType.int64](),
+            n,
+            buffer_size_mb,
+            ctx.get_device_context(),
+        )
+
+
+@compiler.register("rfft")
+struct RFFT:
+    @staticmethod
+    def execute[
+        target: StaticString,
+        dtype: DType,
+        rank: Int,
+        n: Int,
+        buffer_size_mb: Int,
+    ](
+        output: OutputTensor[dtype=dtype, rank=rank, ...],
+        input: InputTensor[dtype=dtype, rank=rank, ...],
+        ctx: DeviceContextPtr,
+    ) raises:
+        comptime assert is_gpu[target](), "only valid on GPUs"
+
+        rfft(
             input.to_tile_tensor[DType.int64](),
             output.to_tile_tensor[DType.int64](),
             n,

@@ -10,6 +10,7 @@ package(default_visibility = [
 _NVIDIA_ONLY_TESTS = [
     "test_float8_e4m3fn.py",
     "test_irfft.py",
+    "test_rfft.py",
 ]
 
 _AMD_ONLY_TESTS = [
