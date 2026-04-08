@@ -580,15 +580,17 @@ class TDTGraphDecoder:
         durations = self.durations
         replay = self.decoder_step_model.replay
 
-        # Reset packed LSTM states to zero.
+        # Reset to start-of-sequence: zero LSTM state, blank as the
+        # "previous" token. The first loop iteration runs the predictor
+        # with (blank, zero) — matching the numpy reference decoder in
+        # ``decode.py`` which initialises pred_out from a single
+        # ``prediction_net(blank, zero)`` call before the joint loop.
+        # The previous version of this code did an extra "SOS warmup"
+        # step here whose LSTM output was copied into ``lstm_buf`` before
+        # the loop started, which left the predictor one step ahead of
+        # the encoder timeline and broke transcription.
         lstm_buf.inplace_copy_from(self._zero_buf)
-
-        # SOS step: blank token at t=0.
         token_buf.inplace_copy_from(token_bufs[blank_id])
-        t_buf.inplace_copy_from(t_index_bufs[0])
-        replay(1, token_buf, lstm_buf, enc_proj_buf, t_buf)
-        # outs: [decisions, lstm_state_packed]
-        lstm_buf.inplace_copy_from(outs[1])
 
         # Greedy decode loop.
         tokens: list[int] = []
