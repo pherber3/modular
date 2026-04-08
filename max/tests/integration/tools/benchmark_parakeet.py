@@ -63,15 +63,32 @@ LIBRISPEECH_URL = "https://www.openslr.org/resources/12/test-clean.tar.gz"
 # ---------------------------------------------------------------------------
 
 
+TRANSCRIPTS_FILE = AUDIO_DIR / "transcripts.json"
+
+
+def load_transcripts() -> dict[str, str]:
+    """Load ground-truth transcripts saved alongside the WAV files.
+
+    Returns a dict mapping ``sample_XXXX`` stem to uppercase reference text,
+    or an empty dict if ``transcripts.json`` has not been written yet.
+    """
+    if TRANSCRIPTS_FILE.exists():
+        return json.loads(TRANSCRIPTS_FILE.read_text())
+    return {}
+
+
 def ensure_audio(n_samples: int = 105) -> list[Path]:
     """Get test WAV files, downloading LibriSpeech test-clean if needed.
+
+    Also writes ``benchmark_audio/transcripts.json`` (stem → reference text)
+    so the WER stage can compare hypotheses against ground truth.
 
     Requires ffmpeg to convert FLAC to WAV.
     """
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
     existing = sorted(AUDIO_DIR.glob("*.wav"))
-    if len(existing) >= n_samples:
+    if len(existing) >= n_samples and TRANSCRIPTS_FILE.exists():
         return existing[:n_samples]
 
     if not shutil.which("ffmpeg"):
@@ -85,14 +102,35 @@ def ensure_audio(n_samples: int = 105) -> list[Path]:
         urllib.request.urlretrieve(LIBRISPEECH_URL, tar_path)
 
     flac_paths: list[str] = []
+    # stem (e.g. "1089-134686-0000") → uppercase transcript
+    stem_to_ref: dict[str, str] = {}
+
     with tarfile.open(tar_path, "r:gz") as tar:
+        # First pass: collect FLAC names and parse all .trans.txt files.
         for member in tar.getmembers():
             if member.name.endswith(".flac") and len(flac_paths) < n_samples:
                 flac_paths.append(member.name)
+            elif member.name.endswith(".trans.txt"):
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                for line in f.read().decode().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    uttid, _, text = line.partition(" ")
+                    stem_to_ref[uttid] = text.upper()
 
         wav_paths: list[Path] = []
+        sample_transcripts: dict[str, str] = {}
         for i, flac_name in enumerate(flac_paths):
             wav_path = AUDIO_DIR / f"sample_{i:04d}.wav"
+            # Stem: e.g. "1089-134686-0000" from
+            # "LibriSpeech/test-clean/1089/134686/1089-134686-0000.flac"
+            flac_stem = Path(flac_name).stem
+            if flac_stem in stem_to_ref:
+                sample_transcripts[f"sample_{i:04d}"] = stem_to_ref[flac_stem]
+
             if wav_path.exists():
                 wav_paths.append(wav_path)
                 continue
@@ -109,6 +147,11 @@ def ensure_audio(n_samples: int = 105) -> list[Path]:
 
             if (i + 1) % 20 == 0:
                 print(f"  Converted {i + 1}/{len(flac_paths)}")
+
+    # Write transcripts alongside WAVs (merge with any existing entries).
+    existing_transcripts = load_transcripts()
+    existing_transcripts.update(sample_transcripts)
+    TRANSCRIPTS_FILE.write_text(json.dumps(existing_transcripts, indent=2))
 
     # Clean up extracted FLAC directory structure
     libri_dir = AUDIO_DIR / "LibriSpeech"
@@ -366,6 +409,188 @@ def bench_tdt_decode(n_warmup: int, n_runs: int) -> list[TimingResult]:
             r_loop.times_ms.append((t1 - t0) * 1000)
 
     return [r_lstm, r_joint, r_loop]
+
+
+# ---------------------------------------------------------------------------
+# WER / transcription accuracy check
+# ---------------------------------------------------------------------------
+
+
+def _word_error_rate(ref: str, hyp: str) -> tuple[int, int]:
+    """Compute (edit_distance, ref_word_count) for one utterance.
+
+    Uses dynamic programming on word sequences. Caller accumulates totals
+    and divides at the end: WER = total_edits / total_ref_words.
+    """
+    ref_words = ref.lower().split()
+    hyp_words = hyp.lower().split()
+    r, h = len(ref_words), len(hyp_words)
+    dp = list(range(h + 1))
+    for i in range(1, r + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, h + 1):
+            temp = dp[j]
+            if ref_words[i - 1] == hyp_words[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[h], r
+
+
+def bench_wer(
+    audio_files: list[Path],
+    model_type: str,
+    device: str,
+    encoding: str,
+    n_samples: int,
+) -> None:
+    """Run transcription on ``n_samples`` clips and report WER vs LibriSpeech.
+
+    Prints each hypothesis alongside its reference, then aggregate WER.
+    Requires ``transcripts.json`` to exist (written by ``ensure_audio``).
+    """
+    transcripts = load_transcripts()
+    if not transcripts:
+        print(
+            "  No ground-truth transcripts found. "
+            "Re-run ensure_audio to rebuild transcripts.json."
+        )
+        return
+
+    if model_type == "ctc":
+        model_id = "nvidia/parakeet-ctc-1.1b"
+    else:
+        model_id = "pherber3/parakeet-tdt-0.6b-v3"
+
+    print(f"  Loading {model_type.upper()} model ({model_id}) on {device}...")
+
+    try:
+        from max.pipelines.architectures import register_all_models
+
+        register_all_models()
+        from max.driver import DeviceSpec, load_devices
+        from max.engine import InferenceSession
+        from max.graph.weights import (
+            WeightsFormat,
+            load_weights,
+            weights_format,
+        )
+        from max.pipelines.lib import (
+            KVCacheConfig,
+            MAXModelConfig,
+            PipelineConfig,
+            PipelineRuntimeConfig,
+        )
+        from max.pipelines.lib.hf_utils import download_weight_files
+        from transformers import AutoTokenizer
+
+        device_spec = (
+            DeviceSpec.cpu() if device == "cpu" else DeviceSpec.accelerator()
+        )
+        model_config = MAXModelConfig(
+            device_specs=[device_spec],
+            quantization_encoding=encoding,  # type: ignore[arg-type]
+            model_path=model_id,
+            kv_cache=KVCacheConfig(),
+        )
+        config = PipelineConfig(
+            model=model_config,
+            runtime=PipelineRuntimeConfig(max_num_steps=1),
+        )
+        devices = load_devices(config.model.device_specs)
+        session = InferenceSession(devices=[*devices])
+        weight_paths = download_weight_files(
+            huggingface_model_id=config.model.huggingface_weight_repo_id,
+            filenames=[str(x) for x in config.model.weight_path],
+            revision=config.model.huggingface_weight_revision,
+            force_download=config.model.force_download,
+        )
+        weights = load_weights(weight_paths)
+        wfmt = weights_format(weight_paths)
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        from max.pipelines.architectures.parakeet.model import (
+            ParakeetPipelineModel,
+        )
+        from max.pipelines.architectures.parakeet_tdt.model import (
+            ParakeetTDTPipelineModel,
+        )
+
+        model: ParakeetPipelineModel | ParakeetTDTPipelineModel
+        if model_type == "ctc":
+            from max.pipelines.architectures.parakeet.weight_adapters import (
+                convert_safetensor_state_dict as ctc_adapter,
+            )
+
+            model = ParakeetPipelineModel(
+                pipeline_config=config,
+                session=session,
+                devices=devices,
+                kv_cache_config=config.model.kv_cache,
+                weights=weights,
+                adapter=(
+                    ctc_adapter if wfmt == WeightsFormat.safetensors else None
+                ),
+            )
+        else:
+            from max.pipelines.architectures.parakeet_tdt.weight_adapters import (
+                convert_safetensor_state_dict as tdt_adapter,
+            )
+
+            model = ParakeetTDTPipelineModel(
+                pipeline_config=config,
+                session=session,
+                devices=devices,
+                kv_cache_config=config.model.kv_cache,
+                weights=weights,
+                adapter=(
+                    tdt_adapter if wfmt == WeightsFormat.safetensors else None
+                ),
+            )
+
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        return
+
+    clips = audio_files[:n_samples]
+    total_edits = 0
+    total_words = 0
+    col_w = 60
+
+    print(f"\n  {'FILE':<16s}  {'REF':<{col_w}s}  {'HYP':<{col_w}s}  WER")
+    print("  " + "-" * (16 + 2 + col_w + 2 + col_w + 6))
+
+    for wav_path in clips:
+        stem = wav_path.stem
+        ref = transcripts.get(stem, "")
+        audio_bytes = wav_path.read_bytes()
+
+        hyp = model.transcribe(audio_bytes, tokenizer)
+
+        if ref:
+            edits, nwords = _word_error_rate(ref, hyp)
+            total_edits += edits
+            total_words += nwords
+            utt_wer = edits / nwords if nwords else float("nan")
+            wer_str = f"{utt_wer:.1%}"
+        else:
+            wer_str = "n/a"
+
+        ref_disp = ref[:col_w] if ref else "(no ref)"
+        hyp_disp = hyp[:col_w] if hyp else "(empty)"
+        print(
+            f"  {stem:<16s}  {ref_disp:<{col_w}s}  {hyp_disp:<{col_w}s}  {wer_str}"
+        )
+
+    if total_words:
+        overall_wer = total_edits / total_words
+        print(
+            f"\n  Overall WER: {overall_wer:.2%}  "
+            f"({total_edits} edits / {total_words} ref words, {len(clips)} clips)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -774,9 +999,15 @@ def main() -> None:
     parser.add_argument(
         "--stages",
         default="preprocess,full",
-        help="Comma-separated: preprocess,full,decode_micro,all",
+        help="Comma-separated: preprocess,full,decode_micro,wer,all",
     )
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument(
+        "--wer-samples",
+        type=int,
+        default=10,
+        help="Number of clips to transcribe when running the 'wer' stage",
+    )
     args = parser.parse_args()
 
     stages = set(args.stages.split(","))
@@ -793,11 +1024,13 @@ def main() -> None:
     print(f"Stages:   {args.stages}")
     print()
 
-    n_samples = (
-        args.n_samples
-        if args.n_samples is not None
-        else args.warmup + args.runs
-    )
+    if args.n_samples is not None:
+        n_samples = args.n_samples
+    elif run_all or "wer" in stages:
+        # wer stage needs at least wer_samples clips; other stages may need more
+        n_samples = max(args.warmup + args.runs, args.wer_samples)
+    else:
+        n_samples = args.warmup + args.runs
     audio_files = ensure_audio(n_samples)
     audio_bytes_list = [f.read_bytes() for f in audio_files]
 
@@ -850,6 +1083,17 @@ def main() -> None:
                     args.warmup,
                     args.runs,
                 )
+            )
+
+    if run_all or "wer" in stages:
+        for m in models:
+            print(f"\nWER check ({m.upper()}, {args.wer_samples} clips)...")
+            bench_wer(
+                audio_files,
+                m,
+                args.device,
+                args.encoding,
+                args.wer_samples,
             )
 
     print()
