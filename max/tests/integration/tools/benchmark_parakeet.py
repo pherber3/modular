@@ -250,17 +250,19 @@ def bench_ctc_decode(n_warmup: int, n_runs: int) -> TimingResult:
 
     tokenizer = MockTokenizer()
     rng = np.random.default_rng(42)
-    # Varying sequence lengths to simulate real data
-    logits_list = [
-        rng.standard_normal((1, 100 + i * 30, 1025)).astype(np.float32)
+    # Varying sequence lengths to simulate real data. Post-argmax, the
+    # microbenchmark measures host-side dedup + blank-strip + tokenizer
+    # only — the argmax over vocab now happens inside the encoder graph.
+    predicted_ids_list = [
+        rng.integers(0, 1025, size=(1, 100 + i * 30), dtype=np.int32)
         for i in range(20)
     ]
 
     r = TimingResult("ctc_greedy_decode")
     for i in range(n_warmup + n_runs):
-        logits = logits_list[i % len(logits_list)]
+        predicted_ids = predicted_ids_list[i % len(predicted_ids_list)]
         t0 = time.perf_counter()
-        ctc_greedy_decode(logits, tokenizer, blank_id=1024)
+        ctc_greedy_decode(predicted_ids, tokenizer, blank_id=1024)
         t1 = time.perf_counter()
         if i >= n_warmup:
             r.times_ms.append((t1 - t0) * 1000)
@@ -513,39 +515,22 @@ def bench_full_pipeline(
 
         if model_type == "ctc":
             n_mels = ctc_model.config.num_mel_bins
-            mel_model = (
-                ctc_model._mel_model
-            )  # legacy single-mel-model (CTC pre-Step-7)
-            tdt_buckets = None
-            tdt_mel_models = None
-            tdt_encoder_models = None
+            buckets = ctc_model._buckets
+            mel_models = ctc_model._mel_models
+            encoder_models = ctc_model._encoder_models
         else:
             n_mels = tdt_model.tdt_config.num_mel_bins
-            mel_model = None  # TDT routes per-bucket
-            tdt_buckets = tdt_model._buckets
-            tdt_mel_models = tdt_model._mel_models
-            tdt_encoder_models = tdt_model._encoder_models
+            buckets = tdt_model._buckets
+            mel_models = tdt_model._mel_models
+            encoder_models = tdt_model._encoder_models
 
-        use_gpu_mel = (
-            mel_model is not None or tdt_mel_models is not None
-        ) and device != "cpu"
+        use_gpu_mel = mel_models is not None and device != "cpu"
         if use_gpu_mel:
-            if model_type == "tdt" and tdt_buckets is not None:
-                bucket_summary = ", ".join(
-                    f"{b.duration_s}s" for b in tdt_buckets
-                )
-                print(
-                    f"  Using GPU mel extraction (TDT bucketed: {bucket_summary})"
-                )
-            else:
-                # CTC pre-Step-7 still uses the legacy fixed shape.
-                from max.pipelines.architectures.parakeet.mel_graph import (
-                    MAX_AUDIO_SAMPLES,
-                )
-
-                print(
-                    f"  Using GPU mel extraction (MAX_AUDIO_SAMPLES={MAX_AUDIO_SAMPLES})"
-                )
+            bucket_summary = ", ".join(f"{b.duration_s}s" for b in buckets)
+            print(
+                f"  Using GPU mel extraction "
+                f"({model_type.upper()} bucketed: {bucket_summary})"
+            )
 
         cpu_dev = load_devices([DeviceSpec.cpu()])[0]
 
@@ -562,12 +547,10 @@ def bench_full_pipeline(
             if record:
                 r_wav.times_ms.append((t1 - t0) * 1000)
 
-            # Per-sample bucket selection (TDT only — CTC still pre-Step-7).
-            sample_bucket = None
-            if model_type == "tdt" and tdt_buckets is not None:
-                sample_bucket, _ = select_bucket(
-                    mel_frames_for_audio(len(audio)), tdt_buckets
-                )
+            # Per-sample bucket selection — both CTC and TDT are bucketed.
+            sample_bucket, _ = select_bucket(
+                mel_frames_for_audio(len(audio)), buckets
+            )
 
             if use_gpu_mel:
                 # GPU mel path: preemphasis + pad in numpy, then mel graph on GPU.
@@ -578,16 +561,7 @@ def bench_full_pipeline(
                     )
                 pad_len = N_FFT // 2
                 padded = np.pad(audio, (pad_len, pad_len), mode="constant")
-                if sample_bucket is not None:
-                    # TDT bucketed path: pad to this sample's bucket size.
-                    target_samples = sample_bucket.audio_samples
-                else:
-                    # CTC legacy path: pad to global max.
-                    from max.pipelines.architectures.parakeet.mel_graph import (
-                        MAX_AUDIO_SAMPLES,
-                    )
-
-                    target_samples = MAX_AUDIO_SAMPLES
+                target_samples = sample_bucket.audio_samples
                 if len(padded) < target_samples:
                     padded = np.pad(padded, (0, target_samples - len(padded)))
                 elif len(padded) > target_samples:
@@ -599,13 +573,8 @@ def bench_full_pipeline(
 
                 t0 = time.perf_counter()
                 audio_buf = Buffer.from_numpy(audio_input).to(devices[0])
-                if sample_bucket is not None:
-                    assert tdt_mel_models is not None
-                    bucket_mel_model = tdt_mel_models[sample_bucket.mel_frames]
-                    buf = bucket_mel_model.execute(audio_buf)[0]
-                else:
-                    assert mel_model is not None
-                    buf = mel_model.execute(audio_buf)[0]
+                assert mel_models is not None
+                buf = mel_models[sample_bucket.mel_frames].execute(audio_buf)[0]
                 # Normalization is fused into the mel graph — no D2H round-trip.
                 t1 = time.perf_counter()
                 if record:
@@ -626,11 +595,7 @@ def bench_full_pipeline(
 
                 t0 = time.perf_counter()
                 features = normalize_per_feature(features).astype(np.float32)
-                if sample_bucket is not None:
-                    target_mel_frames = sample_bucket.mel_frames
-                else:
-                    # CTC legacy path: pad to global max.
-                    target_mel_frames = 3200
+                target_mel_frames = sample_bucket.mel_frames
                 if features.shape[1] < target_mel_frames:
                     pad_width = [
                         (0, 0),
@@ -652,9 +617,14 @@ def bench_full_pipeline(
 
             t0 = time.perf_counter()
             if model_type == "ctc":
-                outputs = ctc_model.execute(ParakeetInputs(input_features=buf))
+                outputs = ctc_model.execute(
+                    ParakeetInputs(
+                        input_features=buf,
+                        bucket_mel_frames=sample_bucket.mel_frames,
+                        bucket_encoder_frames=sample_bucket.encoder_frames,
+                    )
+                )
             else:
-                assert sample_bucket is not None
                 outputs = tdt_model.execute(
                     ParakeetTDTInputs(
                         input_features=buf,
@@ -668,15 +638,17 @@ def bench_full_pipeline(
 
             if model_type == "ctc":
                 t0 = time.perf_counter()
-                out_buf = outputs.logits
+                out_buf = outputs.logits  # Now int32 predicted_ids post-Step-7
                 assert out_buf is not None
-                logits = np.from_dlpack(out_buf.to(cpu_dev)).copy()
+                predicted_ids = np.from_dlpack(out_buf.to(cpu_dev)).copy()
+                # Slice off the padded tail before dedup.
+                predicted_ids = predicted_ids[:, : sample_bucket.encoder_frames]
                 t1 = time.perf_counter()
                 if record:
                     r_transfer.times_ms.append((t1 - t0) * 1000)
 
                 t0 = time.perf_counter()
-                ctc_greedy_decode(logits, tokenizer, blank_id=1024)
+                ctc_greedy_decode(predicted_ids, tokenizer, blank_id=1024)
                 t1 = time.perf_counter()
                 if record:
                     r_decode.times_ms.append((t1 - t0) * 1000)
@@ -684,7 +656,6 @@ def bench_full_pipeline(
                 # TDT: graph decoder handles projection + decode on-device.
                 # Transfer time is near-zero (only logits per step).
                 assert outputs.logits is not None
-                assert sample_bucket is not None
                 t0 = time.perf_counter()
                 t1 = time.perf_counter()
                 if record:

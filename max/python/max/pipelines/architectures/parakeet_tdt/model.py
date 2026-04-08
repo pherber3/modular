@@ -152,9 +152,7 @@ def build_graph(
             # paddings: [before_batch,  after_batch,
             #            before_time,   after_time,
             #            before_hidden, after_hidden]
-            enc_projected = ops.pad(
-                enc_projected, [0, 0, 0, pad_len, 0, 0]
-            )
+            enc_projected = ops.pad(enc_projected, [0, 0, 0, pad_len, 0, 0])
 
         graph.output(enc_projected)
 
