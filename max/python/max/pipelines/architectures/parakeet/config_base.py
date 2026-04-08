@@ -126,15 +126,13 @@ class ParakeetConfigBase(ArchConfig):
 
         One encoder graph is compiled per bucket and each utterance is routed
         to the smallest bucket that fits. Override in ``config.json`` via
-        ``bucket_durations_s: [10, 20, ...]``. Default covers 10s through 60s
-        in 10-second increments.
+        ``bucket_durations_s: [10, 20, ...]``.
+
+        TEMPORARY: hardcoded to a single 20s bucket while we debug the CTC
+        OOM on L4 (Checkpoint D). Revert to ``DEFAULT_BUCKET_DURATIONS_S``
+        once we know one bucket works end-to-end.
         """
-        durations = getattr(
-            self.huggingface_config,
-            "bucket_durations_s",
-            DEFAULT_BUCKET_DURATIONS_S,
-        )
-        return tuple(durations)
+        return (20,)
 
     @override
     def get_max_seq_len(self) -> int:
