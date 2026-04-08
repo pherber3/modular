@@ -124,15 +124,20 @@ class ParakeetConfigBase(ArchConfig):
     def bucket_durations_s(self) -> tuple[int, ...]:
         """Audio-length buckets (seconds) the encoder will be compiled for.
 
-        One encoder graph is compiled per bucket and each utterance is routed
-        to the smallest bucket that fits. Override in ``config.json`` via
-        ``bucket_durations_s: [10, 20, ...]``.
-
-        TEMPORARY: hardcoded to a single 20s bucket while we debug the CTC
-        OOM on L4 (Checkpoint D). Revert to ``DEFAULT_BUCKET_DURATIONS_S``
-        once we know one bucket works end-to-end.
+        One encoder graph is compiled per bucket and each utterance is
+        routed to the smallest bucket that fits. Override in
+        ``config.json`` via ``bucket_durations_s: [10, 20, ...]``, or
+        per-architecture via a subclass override (see
+        ``ParakeetModelConfig.bucket_durations_s`` for CTC's smaller
+        default). Base-class default covers 10s through 60s in 10-second
+        increments.
         """
-        return (20,)
+        durations = getattr(
+            self.huggingface_config,
+            "bucket_durations_s",
+            DEFAULT_BUCKET_DURATIONS_S,
+        )
+        return tuple(durations)
 
     @override
     def get_max_seq_len(self) -> int:

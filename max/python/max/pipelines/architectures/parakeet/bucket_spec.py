@@ -81,9 +81,19 @@ def _bucket_for_duration(duration_s: int) -> ParakeetBucket:
     )
 
 
-# Default bucket set: 10s through 60s in 10-second increments. Covers the
-# range of typical VAD-segmented production audio. Compile time is ~1.5-3min.
+# Default bucket set for TDT: 10s through 60s in 10-second increments.
+# Covers the range of typical VAD-segmented production audio. Compile
+# time is ~1.5-3min. TDT's 0.6B-param encoder × 6 copies = ~14GB on GPU,
+# fits comfortably on L4 (24GB).
 DEFAULT_BUCKET_DURATIONS_S: tuple[int, ...] = (10, 20, 30, 40, 50, 60)
+
+# CTC-specific bucket set: fewer/coarser buckets than TDT because the
+# CTC encoder is 1.1B params (vs. TDT's 0.6B). MAX's ``session.load``
+# does not share weight buffers across loads on GPU, so each bucket
+# uploads a fresh ~4.4GB copy of the CTC weights. 6 buckets = ~26GB and
+# OOMs on L4. 4 buckets = ~17.6GB, fits with headroom. Same 60s ceiling.
+# See commit 15e2262374 for the MAX weight-materialization behavior.
+CTC_DEFAULT_BUCKET_DURATIONS_S: tuple[int, ...] = (15, 30, 45, 60)
 
 DEFAULT_BUCKETS: tuple[ParakeetBucket, ...] = tuple(
     _bucket_for_duration(d) for d in DEFAULT_BUCKET_DURATIONS_S
