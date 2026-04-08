@@ -199,7 +199,15 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
                 self.pipeline_config, self.weights, self.adapter
             )
 
-            graph = build_graph(self.config, state_dict)
+            # Legacy fixed-shape CTC graph: 3200 mel frames → 400 encoder
+            # frames, no output padding. Step 7 of the bucketing refactor
+            # replaces this with a per-bucket dict.
+            graph = build_graph(
+                self.config,
+                state_dict,
+                num_frames=3200,
+                pad_to_encoder_frames=400,
+            )
             timer.mark_build_complete()
 
             model = session.load(graph, weights_registry=state_dict)

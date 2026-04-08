@@ -259,6 +259,7 @@ def build_decoder_step_graph(
     config: TDTModelConfig,
     prediction_state_dict: Mapping[str, np.ndarray],
     joint_state_dict: Mapping[str, np.ndarray],
+    max_encoder_len: int,
 ) -> Graph:
     """Build the single-step decoder graph for TDT.
 
@@ -271,6 +272,10 @@ def build_decoder_step_graph(
             (keys relative to prediction module).
         joint_state_dict: Weights for JointNetworkGraph
             (keys relative to joint module).
+        max_encoder_len: Maximum encoder-frame count to compile against.
+            The ``enc_projected`` input is shaped ``[1, max_encoder_len, joint_hidden]``.
+            All bucket-specific encoder graphs zero-pad their output to this
+            size, so a single decoder step graph serves every bucket.
 
     Returns:
         Compiled graph with 4 inputs and 2 outputs
@@ -282,7 +287,6 @@ def build_decoder_step_graph(
     num_durations = len(config.tdt_durations)
     output_size = vocab_size + 1 + num_durations  # vocab + blank + durations
     device = config.device
-    max_encoder_len = TDTGraphDecoder.MAX_ENCODER_FRAMES
 
     # 4 inputs: token_id, lstm_state_packed, enc_projected, t_index
     input_types = [
@@ -446,12 +450,14 @@ class TDTGraphDecoder:
     The encoder graph already includes the projection (1024→640), so
     this class only runs the decoder step graph in a loop. All buffers
     are pre-allocated at init for zero-allocation decode loops.
-    """
 
-    # Fixed input/encoder frame counts. 3200 mel frames ≈ 20s audio at
-    # 16kHz with hop=160. 8x subsampling → 400 encoder timesteps.
-    MAX_INPUT_FRAMES = 3200
-    MAX_ENCODER_FRAMES = MAX_INPUT_FRAMES // 8  # 400
+    The decoder step graph is compiled once at ``max_encoder_len`` (the
+    largest bucket's encoder-frame count). Each bucket's encoder graph
+    zero-pads its output to that size, so a single CUDA-graph capture
+    serves every audio length. The Python loop bound (``actual_t``) comes
+    from the bucket the caller routed to, so short clips don't iterate
+    the padded tail.
+    """
 
     def __init__(
         self,
@@ -459,11 +465,13 @@ class TDTGraphDecoder:
         config: TDTModelConfig,
         device: Device,
         cpu_device: Device,
+        max_encoder_len: int,
     ) -> None:
         self.decoder_step_model = decoder_step_model
         self.config = config
         self.device = device
         self.cpu_device = cpu_device
+        self.max_encoder_len = max_encoder_len
 
         self.vocab_size = config.vocab_size
         self.blank_id = config.blank_id
@@ -472,7 +480,7 @@ class TDTGraphDecoder:
         self.joint_hidden = config.joint_hidden
 
         # Pre-allocate ALL small buffers at init.
-        max_t = self.MAX_ENCODER_FRAMES
+        max_t = self.max_encoder_len
         self._t_index_bufs = [
             Buffer.from_numpy(np.array([t], dtype=np.int32)).to(device)
             for t in range(max_t)
@@ -531,7 +539,7 @@ class TDTGraphDecoder:
         self._captured = True
         logger.info("Captured decoder step CUDA graph")
 
-    def decode(self, enc_projected: Buffer) -> list[list[int]]:
+    def decode(self, enc_projected: Buffer, actual_t: int) -> list[list[int]]:
         """Run TDT greedy decode with CUDA graph replay.
 
         Each step: replay captured graph → copy packed LSTM output back
@@ -539,12 +547,18 @@ class TDTGraphDecoder:
 
         Args:
             enc_projected: Pre-projected encoder output on GPU,
-                shape ``(1, T, joint_hidden)``.
+                shape ``(1, max_encoder_len, joint_hidden)``. The encoder
+                graph zero-pads its output to ``max_encoder_len`` so this
+                buffer is always the same size regardless of bucket.
+            actual_t: The true (un-padded) encoder-frame count for this
+                utterance — i.e. the bucket's ``encoder_frames``. The
+                decode loop stops here so short clips don't iterate the
+                zero-padded tail.
 
         Returns:
             List of token ID sequences (one per batch element).
         """
-        T = self.MAX_ENCODER_FRAMES
+        T = actual_t
 
         if not self._captured:
             self._capture_graph(enc_projected)

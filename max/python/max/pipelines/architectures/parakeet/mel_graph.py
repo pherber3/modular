@@ -32,7 +32,9 @@ HOP_LENGTH = 160
 WIN_LENGTH = 400
 LOG_EPSILON = 2**-24
 
-# Maximum mel frames the encoder accepts (matches TDTGraphDecoder.MAX_INPUT_FRAMES).
+# Maximum mel frames the encoder accepts. Will be replaced by per-bucket
+# values in Step 8 of the bucketing refactor; kept here for callers that
+# still use the legacy fixed-shape mel graph.
 MAX_MEL_FRAMES = 3200
 
 # Maximum audio samples after center-padding, derived from MAX_MEL_FRAMES.

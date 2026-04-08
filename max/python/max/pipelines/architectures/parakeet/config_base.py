@@ -30,6 +30,8 @@ from max.pipelines.lib.interfaces.arch_config import ArchConfig
 from transformers import AutoConfig
 from typing_extensions import Self, override
 
+from .bucket_spec import DEFAULT_BUCKET_DURATIONS_S
+
 
 @dataclass(kw_only=True)
 class ParakeetConfigBase(ArchConfig):
@@ -117,6 +119,22 @@ class ParakeetConfigBase(ArchConfig):
     def convolution_bias(self) -> bool:
         """Whether conv layers use bias. CTC defaults True, TDT False."""
         return getattr(self.encoder_config, "convolution_bias", True)
+
+    @property
+    def bucket_durations_s(self) -> tuple[int, ...]:
+        """Audio-length buckets (seconds) the encoder will be compiled for.
+
+        One encoder graph is compiled per bucket and each utterance is routed
+        to the smallest bucket that fits. Override in ``config.json`` via
+        ``bucket_durations_s: [10, 20, ...]``. Default covers 10s through 60s
+        in 10-second increments.
+        """
+        durations = getattr(
+            self.huggingface_config,
+            "bucket_durations_s",
+            DEFAULT_BUCKET_DURATIONS_S,
+        )
+        return tuple(durations)
 
     @override
     def get_max_seq_len(self) -> int:

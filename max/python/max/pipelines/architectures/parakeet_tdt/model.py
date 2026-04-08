@@ -31,7 +31,7 @@ import numpy.typing as npt
 from max.driver import Buffer, Device, DeviceSpec, DLPackArray, load_devices
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, Graph, TensorType
+from max.graph import DeviceRef, Graph, TensorType, ops
 from max.graph.weights import WeightData, Weights, WeightsAdapter
 from max.nn import Linear
 from max.nn.kv_cache import KVCacheInputs
@@ -49,8 +49,16 @@ from max.pipelines.lib.utils import parse_state_dict_from_weights
 from transformers import AutoConfig, PreTrainedTokenizer
 
 from ..parakeet.audio import extract_mel, normalize_per_feature, read_wav
+from ..parakeet.bucket_spec import (
+    N_FFT,
+    SAMPLE_RATE,
+    ParakeetBucket,
+    build_buckets,
+    mel_frames_for_audio,
+    select_bucket,
+)
 from ..parakeet.encoder import ParakeetEncoder
-from ..parakeet.mel_graph import MAX_AUDIO_SAMPLES, N_FFT, build_mel_graph
+from ..parakeet.mel_graph import build_mel_graph
 from .decoder_graph import (
     TDTGraphDecoder,
     build_decoder_step_graph,
@@ -65,27 +73,53 @@ logger = logging.getLogger("max.pipelines")
 
 @dataclass
 class ParakeetTDTInputs(ModelInputs):
-    """Model inputs for Parakeet-TDT inference."""
+    """Model inputs for Parakeet-TDT inference.
 
-    input_features: Buffer  # (batch, num_frames, num_mel_bins)
+    Attributes:
+        input_features: Mel features sized for this bucket's encoder graph,
+            shape ``(1, bucket.mel_frames, num_mel_bins)``.
+        bucket_mel_frames: The mel-frame count of the bucket this input
+            was prepared for. Used by ``execute()`` to dispatch to the
+            matching encoder model in ``self._encoder_models``.
+        bucket_encoder_frames: The bucket's true (un-padded) encoder-frame
+            count. Passed to the decoder loop as ``actual_t`` so it stops
+            at the right place instead of iterating the zero-padded tail.
+    """
+
+    input_features: Buffer
+    bucket_mel_frames: int
+    bucket_encoder_frames: int
 
 
 def build_graph(
     config: TDTModelConfig,
     state_dict: Mapping[str, DLPackArray | WeightData],
+    num_frames: int,
+    pad_to_encoder_frames: int,
 ) -> Graph:
     """Build the encoder + joint-encoder-projection computation graph.
 
     The graph takes mel spectrogram input and returns the pre-projected
-    encoder output ``(1, T, joint_hidden)``. Fusing the projection here
-    eliminates a separate model.execute() call per utterance.
+    encoder output ``(1, pad_to_encoder_frames, joint_hidden)``. Fusing
+    the projection here eliminates a separate ``model.execute()`` call per
+    utterance.
+
+    Args:
+        config: TDT model configuration.
+        state_dict: Encoder weights.
+        num_frames: Fixed mel-frame count this graph compiles against.
+            Each bucket builds its own graph at its own ``num_frames``.
+        pad_to_encoder_frames: The global maximum encoder-frame count
+            (across all buckets). The output ``enc_projected`` is
+            zero-padded along the time axis to this size so all bucket
+            graphs return the same shape — the decoder step graph is
+            compiled against this same constant, and the actual loop
+            bound (``actual_t``) comes from the bucket the caller routed
+            to so the padded tail is never iterated.
     """
     input_type = TensorType(
         DType.float32,
-        # Use fixed num_frames to avoid GPU compiler issues with derived
-        # symbolic dimensions from conv subsampling.
-        # Shorter inputs are padded, longer inputs are truncated.
-        shape=[1, TDTGraphDecoder.MAX_INPUT_FRAMES, config.num_mel_bins],
+        shape=[1, num_frames, config.num_mel_bins],
         device=config.device,
     )
 
@@ -106,6 +140,22 @@ def build_graph(
         enc_proj.load_state_dict(state_dict, strict=False)
         enc_projected = enc_proj(hidden_states)
 
+        # Zero-pad the time axis to the global max so every bucket's
+        # encoder graph returns ``[1, pad_to_encoder_frames, joint_hidden]``
+        # — required so a single decoder step graph + CUDA-graph capture
+        # serves every audio length without a per-bucket graph rebuild.
+        # Uses ``ops.pad`` so the compiler emits a single constant-pad
+        # kernel rather than materializing a zero tensor + concat.
+        bucket_encoder_frames = num_frames // 8
+        pad_len = pad_to_encoder_frames - bucket_encoder_frames
+        if pad_len > 0:
+            # paddings: [before_batch,  after_batch,
+            #            before_time,   after_time,
+            #            before_hidden, after_hidden]
+            enc_projected = ops.pad(
+                enc_projected, [0, 0, 0, pad_len, 0, 0]
+            )
+
         graph.output(enc_projected)
 
     return graph
@@ -114,10 +164,11 @@ def build_graph(
 class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
     """Pipeline model for Parakeet-TDT ASR inference.
 
-    Loads three compiled MAX graphs into a single InferenceSession:
-    1. Encoder graph — FastConformer, mel → encoder hidden states
-    2. Projection graph — pre-projects encoder output (1024→640) once
-    3. Decoder step graph — one LSTM + joint step, called in a loop
+    Compiles N encoder graphs (one per bucket in
+    ``tdt_config.bucket_durations_s``), N matching mel preprocessing
+    graphs (when running on GPU), and a single decoder step graph
+    compiled at the largest bucket's encoder-frame count. Each utterance
+    is routed to the smallest bucket that fits its audio length.
 
     All graphs run on the same device (CPU or GPU). Encoder output flows
     between graphs as Buffers with no host transfer.
@@ -144,6 +195,16 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
         )
         self.tdt_config = TDTModelConfig.initialize(self.pipeline_config)
 
+        # Build the bucket set from config and pre-compute the global
+        # max encoder-frame count. The decoder step graph compiles once
+        # at this size and every encoder bucket pads its output to match.
+        self._buckets: tuple[ParakeetBucket, ...] = build_buckets(
+            self.tdt_config.bucket_durations_s
+        )
+        self._max_encoder_frames: int = max(
+            b.encoder_frames for b in self._buckets
+        )
+
         # Load decoder/joint NPZ once, split into dicts for encoder
         # projection and decoder step graphs.
         npz_path = huggingface_hub.hf_hub_download(
@@ -154,42 +215,64 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             npz_weights
         )
 
-        self.model = self._load_encoder(session, proj_dict)
+        self._encoder_models, self._mel_models = self._load_encoders(
+            session, proj_dict
+        )
         self._load_decoder(session, pred_dict, joint_dict)
 
-    def _load_encoder(
+    def _load_encoders(
         self,
         session: InferenceSession,
         proj_dict: dict[str, np.ndarray],
-    ) -> Model:
-        """Compile the encoder + projection graph."""
-        with CompilationTimer("Parakeet-TDT") as timer:
-            state_dict = parse_state_dict_from_weights(
-                self.pipeline_config, self.weights, self.adapter
-            )
+    ) -> tuple[dict[int, Model], dict[int, Model] | None]:
+        """Compile one encoder + mel graph per bucket.
 
-            for key, arr in proj_dict.items():
-                state_dict[key] = WeightData.from_numpy(
-                    arr.astype(np.float32), key
+        Returns:
+            ``(encoder_models, mel_models)`` keyed on
+            ``bucket.mel_frames``. ``mel_models`` is ``None`` on CPU
+            (the CPU path uses numpy mel extraction).
+        """
+        state_dict = parse_state_dict_from_weights(
+            self.pipeline_config, self.weights, self.adapter
+        )
+        for key, arr in proj_dict.items():
+            state_dict[key] = WeightData.from_numpy(arr.astype(np.float32), key)
+
+        encoder_models: dict[int, Model] = {}
+        mel_models: dict[int, Model] | None = None
+        on_gpu = self.tdt_config.device != DeviceRef.CPU()
+        if on_gpu:
+            mel_models = {}
+
+        with CompilationTimer("Parakeet-TDT (all buckets)") as timer:
+            for bucket in self._buckets:
+                graph = build_graph(
+                    self.tdt_config,
+                    state_dict,
+                    num_frames=bucket.mel_frames,
+                    pad_to_encoder_frames=self._max_encoder_frames,
                 )
-
-            graph = build_graph(self.tdt_config, state_dict)
+                encoder_models[bucket.mel_frames] = session.load(
+                    graph, weights_registry=state_dict
+                )
+                if mel_models is not None:
+                    mel_graph = build_mel_graph(
+                        n_mels=self.tdt_config.num_mel_bins,
+                        max_audio_samples=bucket.audio_samples,
+                        periodic_window=True,
+                        device=self.tdt_config.device,
+                    )
+                    mel_models[bucket.mel_frames] = session.load(mel_graph)
+                logger.info(
+                    "Compiled TDT bucket: %ds (mel=%d, enc=%d)",
+                    bucket.duration_s,
+                    bucket.mel_frames,
+                    bucket.encoder_frames,
+                )
             timer.mark_build_complete()
-            model = session.load(graph, weights_registry=state_dict)
 
-        self._mel_model: Model | None = None
         self._cpu_device = load_devices([DeviceSpec.cpu()])[0]
-        if self.tdt_config.device != DeviceRef.CPU():
-            mel_graph = build_mel_graph(
-                n_mels=self.tdt_config.num_mel_bins,
-                max_audio_samples=MAX_AUDIO_SAMPLES,
-                periodic_window=True,
-                device=self.tdt_config.device,
-            )
-            self._mel_model = session.load(mel_graph)
-            logger.info("Loaded GPU mel extraction graph")
-
-        return model
+        return encoder_models, mel_models
 
     def _load_decoder(
         self,
@@ -197,10 +280,13 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
         pred_dict: dict[str, np.ndarray],
         joint_dict: dict[str, np.ndarray],
     ) -> None:
-        """Compile the decoder step graph."""
+        """Compile the single decoder step graph at ``max_encoder_len``."""
         with CompilationTimer("TDT-DecoderStep") as timer:
             dec_graph = build_decoder_step_graph(
-                self.tdt_config, pred_dict, joint_dict
+                self.tdt_config,
+                pred_dict,
+                joint_dict,
+                max_encoder_len=self._max_encoder_frames,
             )
             timer.mark_build_complete()
             dec_weights = {**pred_dict, **joint_dict}
@@ -215,11 +301,13 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             config=self.tdt_config,
             device=self.devices[0],
             cpu_device=cpu_device,
+            max_encoder_len=self._max_encoder_frames,
         )
         logger.info(
             "Loaded TDT decoder (MAX graph, device=%s): "
-            "decoder step graph compiled",
+            "decoder step graph compiled at max_encoder_len=%d",
             self.tdt_config.device,
+            self._max_encoder_frames,
         )
 
     @classmethod
@@ -235,87 +323,128 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         assert isinstance(model_inputs, ParakeetTDTInputs)
-        model_outputs = self.model.execute(model_inputs.input_features)
+        encoder_model = self._encoder_models[model_inputs.bucket_mel_frames]
+        model_outputs = encoder_model.execute(model_inputs.input_features)
         assert isinstance(model_outputs[0], Buffer)
         return ModelOutputs(logits=model_outputs[0])
 
     def decode(self, model_inputs: ModelInputs) -> list[list[int]]:
         """Run encoder + TDT greedy decode, returning token ID sequences.
 
-        Encoder output stays as a Buffer on-device. The projection graph
-        pre-projects it once, then the decoder step graph runs in a Python
-        loop with LSTM states flowing as Buffers between iterations.
+        Encoder output stays as a Buffer on-device, padded to
+        ``max_encoder_len``. The decoder loop bound (``actual_t``) is the
+        bucket's true encoder-frame count, so short clips don't iterate
+        the zero-padded tail.
         """
+        assert isinstance(model_inputs, ParakeetTDTInputs)
         outputs = self.execute(model_inputs)
         assert outputs.logits is not None
-        return self.graph_decoder.decode(outputs.logits)
+        return self.graph_decoder.decode(
+            outputs.logits, actual_t=model_inputs.bucket_encoder_frames
+        )
 
-    def prepare_mel_input(self, features: NDFloat) -> ParakeetTDTInputs:
-        """Prepare mel features for model execution.
+    def _select_bucket(self, num_audio_samples: int) -> ParakeetBucket:
+        """Pick the smallest compiled bucket that fits this audio length.
 
-        Applies feature normalization (if configured) and wraps in a Buffer.
-        This is the entry point for audio that has already been converted to
-        mel spectrogram features.
+        Logs a warning and truncates if the audio exceeds the largest
+        bucket — current behavior, just at the bucket-set ceiling instead
+        of the old hardcoded 20s.
+        """
+        bucket, was_truncated = select_bucket(
+            mel_frames_for_audio(num_audio_samples), self._buckets
+        )
+        if was_truncated:
+            logger.warning(
+                "Audio length %.1fs exceeds largest bucket (%ds); truncating",
+                num_audio_samples / SAMPLE_RATE,
+                bucket.duration_s,
+            )
+        return bucket
+
+    def prepare_mel_input(
+        self, features: NDFloat, bucket: ParakeetBucket
+    ) -> ParakeetTDTInputs:
+        """Prepare CPU-extracted mel features for a specific bucket.
+
+        Applies feature normalization (if configured), pads/truncates to
+        ``bucket.mel_frames``, and wraps in a Buffer. Used by the CPU
+        fallback path; GPU callers go through ``_run_for_bucket`` and the
+        compiled mel graph.
 
         Args:
             features: Mel spectrogram, shape ``(batch, num_frames, num_mel_bins)``.
-
-        Returns:
-            Model inputs ready for :meth:`execute` or :meth:`decode`.
+            bucket: The bucket this input is being prepared for.
         """
         if self.tdt_config.normalize_features == "per_feature":
             features = normalize_per_feature(features)
         features = features.astype(np.float32)
-        max_frames = TDTGraphDecoder.MAX_INPUT_FRAMES
-        if features.shape[1] < max_frames:
-            pad_width = [(0, 0), (0, max_frames - features.shape[1]), (0, 0)]
+        if features.shape[1] < bucket.mel_frames:
+            pad_width = [
+                (0, 0),
+                (0, bucket.mel_frames - features.shape[1]),
+                (0, 0),
+            ]
             features = np.pad(features, pad_width)
-        elif features.shape[1] > max_frames:
-            features = features[:, :max_frames, :]
+        elif features.shape[1] > bucket.mel_frames:
+            features = features[:, : bucket.mel_frames, :]
         return ParakeetTDTInputs(
-            input_features=Buffer.from_numpy(features).to(self.devices[0])
+            input_features=Buffer.from_numpy(features).to(self.devices[0]),
+            bucket_mel_frames=bucket.mel_frames,
+            bucket_encoder_frames=bucket.encoder_frames,
         )
 
-    def _prepare_audio_for_mel_graph(
-        self, audio: np.ndarray, preemphasis: float = 0.0
+    def _prepare_audio_for_bucket(
+        self, audio: np.ndarray, bucket: ParakeetBucket
     ) -> np.ndarray:
-        """Apply preemphasis, center-pad, and fit to MAX_AUDIO_SAMPLES.
+        """Center-pad and fit audio to ``bucket.audio_samples``.
 
-        Returns audio as (1, MAX_AUDIO_SAMPLES) float32 numpy array.
+        Returns ``(1, bucket.audio_samples)`` float32. The compiled mel
+        graph for this bucket expects exactly this size.
         """
-        if preemphasis > 0:
-            audio = np.append(audio[0:1], audio[1:] - preemphasis * audio[:-1])
         pad_length = N_FFT // 2
         padded = np.pad(audio, (pad_length, pad_length), mode="constant")
-        if len(padded) < MAX_AUDIO_SAMPLES:
-            padded = np.pad(padded, (0, MAX_AUDIO_SAMPLES - len(padded)))
-        elif len(padded) > MAX_AUDIO_SAMPLES:
-            padded = padded[:MAX_AUDIO_SAMPLES]
+        if len(padded) < bucket.audio_samples:
+            padded = np.pad(padded, (0, bucket.audio_samples - len(padded)))
+        elif len(padded) > bucket.audio_samples:
+            padded = padded[: bucket.audio_samples]
         return padded.reshape(1, -1).astype(np.float32)
+
+    def _run_for_bucket(
+        self, audio: np.ndarray, bucket: ParakeetBucket
+    ) -> list[list[int]]:
+        """End-to-end mel → encoder → decode for a single bucket.
+
+        Picks the bucket's encoder + mel models from the dicts, runs the
+        full pipeline, and returns decoded token IDs.
+        """
+        if self._mel_models is not None:
+            mel_model = self._mel_models[bucket.mel_frames]
+            padded_audio = self._prepare_audio_for_bucket(audio, bucket)
+            audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
+            mel_buf = mel_model.execute(audio_buf)[0]
+            model_inputs = ParakeetTDTInputs(
+                input_features=mel_buf,
+                bucket_mel_frames=bucket.mel_frames,
+                bucket_encoder_frames=bucket.encoder_frames,
+            )
+        else:
+            features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)
+            model_inputs = self.prepare_mel_input(features, bucket)
+
+        return self.decode(model_inputs)
 
     def transcribe(
         self, audio_bytes: bytes, tokenizer: PreTrainedTokenizer
     ) -> str:
-        """Full audio-to-text pipeline: mel extraction → encoder → TDT decode."""
+        """Full audio-to-text pipeline: bucket select → mel → encoder → decode."""
         audio, sample_rate = read_wav(audio_bytes)
         if sample_rate != 16000:
             raise ValueError(
                 f"Expected 16kHz audio, got {sample_rate}Hz. "
                 "Please resample before sending."
             )
-
-        if self._mel_model is not None:
-            # GPU mel extraction path — features stay on device.
-            padded_audio = self._prepare_audio_for_mel_graph(audio)
-            audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
-            mel_buf = self._mel_model.execute(audio_buf)[0]
-            model_inputs = ParakeetTDTInputs(input_features=mel_buf)
-        else:
-            # CPU fallback.
-            features = extract_mel(audio, n_mels=self.tdt_config.num_mel_bins)
-            model_inputs = self.prepare_mel_input(features)
-
-        token_ids_batch = self.decode(model_inputs)
+        bucket = self._select_bucket(len(audio))
+        token_ids_batch = self._run_for_bucket(audio, bucket)
         return tokenizer.decode(token_ids_batch[0], skip_special_tokens=True)
 
     def prepare_initial_token_inputs(
@@ -341,5 +470,9 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
         )
 
     def load_model(self, session: InferenceSession) -> Model:
-        # Required by PipelineModel interface. Actual loading done in __init__.
-        return self.model
+        # Convention only — not used by the base ``PipelineModel``.
+        # Returns the largest bucket so any caller using ``self.model`` as
+        # a sentinel still gets a valid encoder. Actual loading is done
+        # in ``__init__`` via ``_load_encoders``.
+        largest = self._buckets[-1]
+        return self._encoder_models[largest.mel_frames]
