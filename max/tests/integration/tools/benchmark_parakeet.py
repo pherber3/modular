@@ -398,6 +398,17 @@ def bench_full_pipeline(
     r_norm = TimingResult(f"normalize ({model_type})")
     r_buffer = TimingResult(f"buffer_from_numpy ({model_type})")
     r_encoder = TimingResult(f"encoder_execute ({model_type})")
+    # ``Model.execute()`` on GPU is async — it enqueues kernels and
+    # returns as soon as the launch is done, so ``encoder_execute``
+    # above reports launch latency, not real encoder compute. Without
+    # an explicit sync here, the real encoder wall-clock time hides in
+    # the first downstream host-side read (``output_transfer`` for CTC,
+    # ``decode`` for TDT), which makes per-stage attribution wrong. The
+    # sync call below pins the encoder's true wait time in its own
+    # column and leaves the downstream stages reporting what they
+    # actually do. Total e2e is unchanged — the work isn't new, just
+    # correctly accounted.
+    r_encoder_sync = TimingResult(f"encoder_sync_wait ({model_type})")
     r_transfer = TimingResult(f"output_transfer ({model_type})")
     r_decode = TimingResult(f"decode ({model_type})")
     r_e2e = TimingResult(f"end_to_end ({model_type})")
@@ -636,6 +647,19 @@ def bench_full_pipeline(
             if record:
                 r_encoder.times_ms.append((t1 - t0) * 1000)
 
+            # Explicit GPU sync: wait for all encoder kernels to finish
+            # on the device before reading anything host-side. See the
+            # ``r_encoder_sync`` declaration at the top of the function
+            # for the full explanation — tl;dr this is the real encoder
+            # compute time, which would otherwise hide inside the first
+            # downstream host read. Measured as ~26ms on L4 for TDT and
+            # ~36ms for CTC (1.83x ratio ≈ 0.6B vs 1.1B param ratio).
+            t0 = time.perf_counter()
+            devices[0].synchronize()
+            t1 = time.perf_counter()
+            if record:
+                r_encoder_sync.times_ms.append((t1 - t0) * 1000)
+
             if model_type == "ctc":
                 t0 = time.perf_counter()
                 out_buf = outputs.logits
@@ -680,6 +704,7 @@ def bench_full_pipeline(
             r_norm,
             r_buffer,
             r_encoder,
+            r_encoder_sync,
             r_transfer,
             r_decode,
             r_e2e,
