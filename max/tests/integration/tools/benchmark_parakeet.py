@@ -43,6 +43,7 @@ import tarfile
 import time
 import urllib.request
 import wave
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -413,6 +414,13 @@ def bench_full_pipeline(
     r_decode = TimingResult(f"decode ({model_type})")
     r_e2e = TimingResult(f"end_to_end ({model_type})")
 
+    # Per-bucket timing: keyed by bucket duration_s (int).
+    # Tracks encoder_sync_wait, decode, and e2e separately so we can
+    # see how latency scales with utterance length.
+    bucket_sync: dict[int, list[float]] = defaultdict(list)
+    bucket_decode: dict[int, list[float]] = defaultdict(list)
+    bucket_e2e: dict[int, list[float]] = defaultdict(list)
+
     if model_type == "ctc":
         model_id = "nvidia/parakeet-ctc-1.1b"
         preemphasis = 0.97
@@ -696,7 +704,32 @@ def bench_full_pipeline(
 
             e2e_end = time.perf_counter()
             if record:
-                r_e2e.times_ms.append((e2e_end - e2e_start) * 1000)
+                e2e_ms = (e2e_end - e2e_start) * 1000
+                r_e2e.times_ms.append(e2e_ms)
+                bkey = sample_bucket.duration_s
+                bucket_sync[bkey].append(r_encoder_sync.times_ms[-1])
+                bucket_decode[bkey].append(r_decode.times_ms[-1])
+                bucket_e2e[bkey].append(e2e_ms)
+
+        # Per-bucket summary table.
+        if bucket_e2e:
+            print(f"\n  Per-bucket breakdown ({model_type.upper()}):")
+            print(
+                f"  {'bucket':>8s}  {'n':>5s}  "
+                f"{'sync_mean':>10s}  {'sync_p95':>10s}  "
+                f"{'dec_mean':>10s}  {'dec_p95':>10s}  "
+                f"{'e2e_mean':>10s}  {'e2e_p95':>10s}"
+            )
+            for bkey in sorted(bucket_e2e):
+                s = np.array(bucket_sync[bkey])
+                d = np.array(bucket_decode[bkey])
+                e = np.array(bucket_e2e[bkey])
+                print(
+                    f"  {bkey:>7d}s  {len(e):>5d}  "
+                    f"{np.mean(s):>9.1f}ms  {np.percentile(s, 95):>9.1f}ms  "
+                    f"{np.mean(d):>9.1f}ms  {np.percentile(d, 95):>9.1f}ms  "
+                    f"{np.mean(e):>9.1f}ms  {np.percentile(e, 95):>9.1f}ms"
+                )
 
         return [
             r_wav,
