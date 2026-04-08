@@ -444,11 +444,17 @@ def bench_wer(
     device: str,
     encoding: str,
     n_samples: int,
+    force_cpu_mel: bool = False,
 ) -> None:
     """Run transcription on ``n_samples`` clips and report WER vs LibriSpeech.
 
     Prints each hypothesis alongside its reference, then aggregate WER.
     Requires ``transcripts.json`` to exist (written by ``ensure_audio``).
+
+    If ``force_cpu_mel`` is True, the mel models on the loaded model are
+    cleared after init, forcing the CPU numpy mel + ``prepare_mel_input``
+    fallback path. Used to isolate whether bugs live in the GPU mel graph
+    vs. downstream graph decoder — see the diagnostic in the issue.
     """
     transcripts = load_transcripts()
     if not transcripts:
@@ -554,6 +560,14 @@ def bench_wer(
 
         traceback.print_exc()
         return
+
+    if force_cpu_mel:
+        # Drop the compiled mel graphs so ``_run_for_bucket`` falls back
+        # to the numpy ``extract_mel`` + ``prepare_mel_input`` path.
+        # Diagnostic only — isolates GPU mel from the rest of the
+        # pipeline when chasing accuracy regressions.
+        print("  [diagnostic] forcing CPU mel path (mel_models = None)")
+        model._mel_models = None
 
     clips = audio_files[:n_samples]
     total_edits = 0
@@ -1016,6 +1030,17 @@ def main() -> None:
         default=10,
         help="Number of clips to transcribe when running the 'wer' stage",
     )
+    parser.add_argument(
+        "--force-cpu-mel",
+        action="store_true",
+        help=(
+            "WER stage diagnostic: clear the compiled mel graphs after "
+            "model load so transcription uses the numpy CPU mel + "
+            "prepare_mel_input fallback path. Use to isolate whether "
+            "the GPU mel graph or the downstream graph decoder owns a "
+            "transcription regression."
+        ),
+    )
     args = parser.parse_args()
 
     stages = set(args.stages.split(","))
@@ -1102,6 +1127,7 @@ def main() -> None:
                 args.device,
                 args.encoding,
                 args.wer_samples,
+                force_cpu_mel=args.force_cpu_mel,
             )
 
     print()

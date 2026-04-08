@@ -433,12 +433,9 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             mel_model = self._mel_models[bucket.mel_frames]
             padded_audio = self._prepare_audio_for_bucket(audio, bucket)
             audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
-            # Number of mel frames coming from real audio (the rest are
-            # zero-padded out to bucket size). The mel graph uses this to
-            # mask its per-feature normalization so the padded tail
-            # doesn't skew mean/std — without this the TDT decoder
-            # collapses to ~98% WER on padded clips because the
-            # log(2^-24) padding values dominate the per-bin statistics.
+            # Real mel-frame count (the rest of the bucket is zero-padded).
+            # Passed to the mel graph so its per-feature normalization can
+            # mask the padded tail.
             valid_frames = mel_frames_for_audio(len(audio))
             valid_frames_buf = Buffer.from_numpy(
                 np.array([valid_frames], dtype=np.int32)
