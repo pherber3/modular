@@ -250,19 +250,17 @@ def bench_ctc_decode(n_warmup: int, n_runs: int) -> TimingResult:
 
     tokenizer = MockTokenizer()
     rng = np.random.default_rng(42)
-    # Varying sequence lengths to simulate real data. Post-argmax, the
-    # microbenchmark measures host-side dedup + blank-strip + tokenizer
-    # only — the argmax over vocab now happens inside the encoder graph.
-    predicted_ids_list = [
-        rng.integers(0, 1025, size=(1, 100 + i * 30), dtype=np.int32)
+    # Varying sequence lengths to simulate real data
+    logits_list = [
+        rng.standard_normal((1, 100 + i * 30, 1025)).astype(np.float32)
         for i in range(20)
     ]
 
     r = TimingResult("ctc_greedy_decode")
     for i in range(n_warmup + n_runs):
-        predicted_ids = predicted_ids_list[i % len(predicted_ids_list)]
+        logits = logits_list[i % len(logits_list)]
         t0 = time.perf_counter()
-        ctc_greedy_decode(predicted_ids, tokenizer, blank_id=1024)
+        ctc_greedy_decode(logits, tokenizer, blank_id=1024)
         t1 = time.perf_counter()
         if i >= n_warmup:
             r.times_ms.append((t1 - t0) * 1000)
@@ -638,17 +636,17 @@ def bench_full_pipeline(
 
             if model_type == "ctc":
                 t0 = time.perf_counter()
-                out_buf = outputs.logits  # Now int32 predicted_ids post-Step-7
+                out_buf = outputs.logits
                 assert out_buf is not None
-                predicted_ids = np.from_dlpack(out_buf.to(cpu_dev)).copy()
-                # Slice off the padded tail before dedup.
-                predicted_ids = predicted_ids[:, : sample_bucket.encoder_frames]
+                logits = np.from_dlpack(out_buf.to(cpu_dev)).copy()
+                # Slice off the padded tail before greedy decode.
+                logits = logits[:, : sample_bucket.encoder_frames, :]
                 t1 = time.perf_counter()
                 if record:
                     r_transfer.times_ms.append((t1 - t0) * 1000)
 
                 t0 = time.perf_counter()
-                ctc_greedy_decode(predicted_ids, tokenizer, blank_id=1024)
+                ctc_greedy_decode(logits, tokenizer, blank_id=1024)
                 t1 = time.perf_counter()
                 if record:
                     r_decode.times_ms.append((t1 - t0) * 1000)

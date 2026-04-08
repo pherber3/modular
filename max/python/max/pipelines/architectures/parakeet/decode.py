@@ -20,27 +20,30 @@ from transformers import PreTrainedTokenizer
 
 
 def ctc_greedy_decode(
-    predicted_ids: npt.NDArray[np.integer],
+    logits: npt.NDArray[np.floating],
     tokenizer: PreTrainedTokenizer,
     blank_id: int = 1024,
 ) -> list[str]:
-    """Decode pre-argmaxed CTC predictions to text.
+    """Decode CTC logits to text using greedy decoding.
 
-    The argmax over the vocab dimension happens inside the compiled
-    encoder graph on-device (see ``parakeet/graph.py::build_graph``),
-    so this function only handles dedup of consecutive duplicates,
-    stripping CTC blank tokens, and mapping IDs to text via the tokenizer.
+    Applies argmax over the vocab dimension, removes consecutive
+    duplicate tokens, strips CTC blank tokens, then maps remaining IDs
+    to text via the tokenizer.
+
+    On-device argmax is a tracked follow-up but is blocked by a
+    compile-time blowup when combined with the bucketed encoder graphs
+    on L4 (see ``parakeet/graph.py`` docstring). Host-side argmax is
+    the working path for now.
 
     Args:
-        predicted_ids: Argmaxed predictions of shape
-            ``(batch, seq_len)``. Int32 on the GPU path, any integer
-            dtype accepted for portability.
+        logits: Model output of shape ``(batch, seq_len, vocab_size)``.
         tokenizer: HuggingFace tokenizer for ID-to-text conversion.
         blank_id: CTC blank token ID (default 1024, i.e. ``vocab_size - 1``).
 
     Returns:
         List of decoded text strings, one per batch element.
     """
+    predicted_ids = np.argmax(logits, axis=-1)  # (batch, seq_len)
     results: list[str] = []
     for seq in predicted_ids:
         deduped = [int(seq[0])]
