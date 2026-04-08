@@ -12,14 +12,12 @@
 # ===----------------------------------------------------------------------=== #
 """Defines the Parakeet-CTC pipeline model.
 
-Implements the PipelineModel interface for non-autoregressive CTC inference:
-mel spectrogram in, CTC logits out (zero-padded to the global max
-encoder-frame count across all buckets), no KV cache. Compiles one
-encoder + mel graph per bucket in ``config.bucket_durations_s`` and
-dispatches per-utterance to the smallest fitting bucket.
-
-On-device argmax is a tracked follow-up (see ``graph.py`` docstring for
-the failure mode that blocked it in the initial bucketing landing).
+Implements the PipelineModel interface for non-autoregressive CTC
+inference: mel spectrogram in, on-device argmaxed int32 predicted
+token ids out (zero-padded to the global max encoder-frame count
+across all buckets), no KV cache. Compiles one encoder + mel graph
+per bucket in ``config.bucket_durations_s`` and dispatches
+per-utterance to the smallest fitting bucket.
 """
 
 from __future__ import annotations
@@ -145,9 +143,11 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
         """Run the encoder graph for this input's bucket.
 
-        Returns float32 logits padded to the global max encoder-frame
-        count across all buckets; callers slice to the bucket's true
-        ``encoder_frames`` before decoding.
+        Note: for CTC the ``ModelOutputs.logits`` field carries int32
+        argmaxed predicted token ids ``(1, max_encoder_frames)``, **not**
+        raw float32 logits. The on-device argmax lives inside the
+        compiled encoder graph (see ``graph.py::build_graph``). Field
+        name is kept to avoid churning the base ``ModelOutputs`` class.
         """
         assert isinstance(model_inputs, ParakeetInputs)
         encoder_model = self._encoder_models[model_inputs.bucket_mel_frames]
@@ -160,18 +160,20 @@ class ParakeetPipelineModel(PipelineModel[ASRContext]):
     ) -> list[str]:
         """Run encoder + CTC greedy decode, returning transcribed text.
 
-        Transfers the full float32 logits tensor to host, slices off
-        the bucket's zero-padded tail, then argmax + dedup + strip
+        Host-side work is minimal: transfer the int32 predicted_ids
+        tensor, slice off the bucket's zero-padded tail, dedup + strip
         blanks in ``ctc_greedy_decode``.
         """
         assert isinstance(model_inputs, ParakeetInputs)
         outputs = self.execute(model_inputs)
         assert outputs.logits is not None
-        logits = np.from_dlpack(outputs.logits.to(self._cpu_device)).copy()
-        # Slice off the padded tail before decode.
-        logits = logits[:, : model_inputs.bucket_encoder_frames, :]
+        predicted_ids = np.from_dlpack(
+            outputs.logits.to(self._cpu_device)
+        ).copy()
+        # Slice off the padded tail before dedup.
+        predicted_ids = predicted_ids[:, : model_inputs.bucket_encoder_frames]
         return ctc_greedy_decode(
-            logits, tokenizer, blank_id=self.config.blank_id
+            predicted_ids, tokenizer, blank_id=self.config.blank_id
         )
 
     def _select_bucket(self, num_audio_samples: int) -> ParakeetBucket:
