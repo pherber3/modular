@@ -250,9 +250,20 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
                     num_frames=bucket.mel_frames,
                     pad_to_encoder_frames=self._max_encoder_frames,
                 )
-                encoder_models[bucket.mel_frames] = session.load(
-                    graph, weights_registry=state_dict
-                )
+                try:
+                    encoder_models[bucket.mel_frames] = session.load(
+                        graph, weights_registry=state_dict
+                    )
+                except Exception as e:
+                    if "out of memory" in str(e).lower() or "oom" in str(e).lower():
+                        raise RuntimeError(
+                            f"GPU out of memory compiling TDT bucket "
+                            f"{bucket.duration_s}s. Reduce bucket count via "
+                            f"bucket_durations_s in your model config. "
+                            f"Configured buckets: "
+                            f"{[b.duration_s for b in self._buckets]}"
+                        ) from e
+                    raise
                 if mel_models is not None:
                     mel_graph = build_mel_graph(
                         n_mels=self.tdt_config.num_mel_bins,
