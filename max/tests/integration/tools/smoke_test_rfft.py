@@ -138,16 +138,23 @@ def main() -> None:
         audio, n_mels=128, preemphasis=preemphasis, periodic_window=False
     )
 
-    # GPU: build and run mel graph
+    # GPU: build and run mel graph. Disable normalization so the output
+    # is directly comparable to ``extract_mel`` (which returns raw
+    # log-mel). The production graph normalizes with a valid-frames mask.
     mel_graph = build_mel_graph(
         n_mels=128,
         max_audio_samples=padded_len,
         periodic_window=False,
         device=DeviceRef.GPU(),
+        normalize=False,
     )
     mel_model = session.load(mel_graph)
     audio_gpu = Buffer.from_numpy(audio_padded.reshape(1, -1)).to(gpu)
-    result_gpu = mel_model(audio_gpu)[0]
+    n_frames = 1 + (padded_len - N_FFT) // 160  # HOP_LENGTH=160
+    valid_frames_gpu = Buffer.from_numpy(
+        np.array([n_frames], dtype=np.int32)
+    ).to(gpu)
+    result_gpu = mel_model(audio_gpu, valid_frames_gpu)[0]
     result_cpu = result_gpu.to(md.CPU())
     gpu_mel = np.from_dlpack(result_cpu).copy()
 

@@ -799,6 +799,9 @@ def bench_full_pipeline(
             if use_gpu_mel:
                 # GPU mel path: preemphasis + pad in numpy, then mel graph on GPU.
                 t0 = time.perf_counter()
+                # Capture the true mel-frame count BEFORE padding so the mel
+                # graph's normalization can mask the zero-padded tail.
+                valid_frames = mel_frames_for_audio(len(audio))
                 if preemphasis > 0:
                     audio = np.append(
                         audio[0:1], audio[1:] - preemphasis * audio[:-1]
@@ -817,8 +820,13 @@ def bench_full_pipeline(
 
                 t0 = time.perf_counter()
                 audio_buf = Buffer.from_numpy(audio_input).to(devices[0])
+                valid_frames_buf = Buffer.from_numpy(
+                    np.array([valid_frames], dtype=np.int32)
+                ).to(devices[0])
                 assert mel_models is not None
-                buf = mel_models[sample_bucket.mel_frames].execute(audio_buf)[0]
+                buf = mel_models[sample_bucket.mel_frames].execute(
+                    audio_buf, valid_frames_buf
+                )[0]
                 # Normalization is fused into the mel graph — no D2H round-trip.
                 t1 = time.perf_counter()
                 if record:

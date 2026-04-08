@@ -255,7 +255,10 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
                         graph, weights_registry=state_dict
                     )
                 except Exception as e:
-                    if "out of memory" in str(e).lower() or "oom" in str(e).lower():
+                    if (
+                        "out of memory" in str(e).lower()
+                        or "oom" in str(e).lower()
+                    ):
                         raise RuntimeError(
                             f"GPU out of memory compiling TDT bucket "
                             f"{bucket.duration_s}s. Reduce bucket count via "
@@ -430,7 +433,17 @@ class ParakeetTDTPipelineModel(PipelineModel[ASRContext]):
             mel_model = self._mel_models[bucket.mel_frames]
             padded_audio = self._prepare_audio_for_bucket(audio, bucket)
             audio_buf = Buffer.from_numpy(padded_audio).to(self.devices[0])
-            mel_buf = mel_model.execute(audio_buf)[0]
+            # Number of mel frames coming from real audio (the rest are
+            # zero-padded out to bucket size). The mel graph uses this to
+            # mask its per-feature normalization so the padded tail
+            # doesn't skew mean/std — without this the TDT decoder
+            # collapses to ~98% WER on padded clips because the
+            # log(2^-24) padding values dominate the per-bin statistics.
+            valid_frames = mel_frames_for_audio(len(audio))
+            valid_frames_buf = Buffer.from_numpy(
+                np.array([valid_frames], dtype=np.int32)
+            ).to(self.devices[0])
+            mel_buf = mel_model.execute(audio_buf, valid_frames_buf)[0]
             model_inputs = ParakeetTDTInputs(
                 input_features=mel_buf,
                 bucket_mel_frames=bucket.mel_frames,

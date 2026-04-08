@@ -67,7 +67,11 @@ def build_mel_graph(
     """Build a MAX graph for GPU mel spectrogram extraction.
 
     The graph expects center-padded, preemphasis-applied audio as input
-    and outputs log-mel features.
+    plus a scalar ``valid_frames`` int32 telling normalization how many
+    leading mel frames came from real audio (the rest are zero-padded).
+    Outputs log-mel features with per-feature normalization computed
+    over only the valid frames and the padded tail mean-filled so it
+    doesn't pollute the encoder's self-attention.
 
     Args:
         n_mels: Number of mel frequency bins.
@@ -78,7 +82,8 @@ def build_mel_graph(
         device: Target device (must be GPU for rfft).
 
     Returns:
-        Graph with input (1, max_audio_samples) -> output (1, n_frames, n_mels).
+        Graph with inputs ``(1, max_audio_samples)`` audio + ``(1,)``
+        valid_frames -> output ``(1, n_frames, n_mels)``.
     """
     n_frames = 1 + (max_audio_samples - N_FFT) // HOP_LENGTH
 
@@ -86,16 +91,26 @@ def build_mel_graph(
     padded_window = _build_padded_window(periodic_window)
     frame_indices = _build_frame_indices(n_frames)
     mel_basis = _mel_filterbank(SAMPLE_RATE, N_FFT, n_mels).astype(np.float32)
+    frame_arange = np.arange(n_frames, dtype=np.int32)
 
-    input_type = TensorType(
+    audio_input_type = TensorType(
         DType.float32,
         shape=[1, max_audio_samples],
         device=device,
     )
+    valid_frames_input_type = TensorType(
+        DType.int32,
+        shape=[1],
+        device=device,
+    )
 
-    with Graph("parakeet_mel", input_types=[input_type]) as graph:
+    with Graph(
+        "parakeet_mel",
+        input_types=[audio_input_type, valid_frames_input_type],
+    ) as graph:
         # Input: (1, audio_length) — center-padded audio on GPU.
         audio = graph.inputs[0].tensor  # (1, audio_length)
+        valid_frames = graph.inputs[1].tensor  # (1,) int32
         audio_1d = audio.reshape((max_audio_samples,))  # (audio_length,)
 
         # 1. Frame extraction via gather.
@@ -132,12 +147,35 @@ def build_mel_graph(
         log_mel = log_mel.reshape((1, n_frames, n_mels))
 
         if normalize:
-            # Per-feature normalization on GPU: (x - mean) / (std + 1e-5)
-            # ops.mean/sum keep dims, so mean is (1, 1, n_mels).
-            mean = ops.mean(log_mel, axis=1)  # (1, 1, n_mels)
-            diff = log_mel - mean
-            var = ops.mean(diff * diff, axis=1)  # (1, 1, n_mels)
-            log_mel = diff * ops.rsqrt(var + 1e-5)
+            # Padding-aware per-feature normalization. The bucket pads
+            # short utterances with zero audio whose log-mel is
+            # ``log(2^-24) ≈ -16.6`` per bin — far below real speech
+            # values. Including those frames in the mean/std skews the
+            # statistics enough to break TDT decoding (CTC tolerated it
+            # at ~2% WER but TDT collapsed to 98% WER on padded clips).
+            # Match HF ParakeetFeatureExtractor and NeMo's
+            # AudioToMelSpectrogramPreprocessor: compute mean/var over
+            # only the valid leading frames.
+            arange = ops.constant(frame_arange, DType.int32, device)
+            valid_count = ops.cast(valid_frames, DType.int32)  # (1,)
+            mask_bool = arange < valid_count  # (n_frames,) bool
+            mask = ops.cast(mask_bool, DType.float32)  # (n_frames,)
+            mask_3d = mask.reshape((1, n_frames, 1))  # (1, n_frames, 1)
+            valid_count_f = ops.cast(valid_frames, DType.float32).reshape(
+                (1, 1, 1)
+            )
+
+            masked = log_mel * mask_3d
+            mean = ops.sum(masked, axis=1) / valid_count_f  # (1, 1, n_mels)
+            diff = (log_mel - mean) * mask_3d
+            var = ops.sum(diff * diff, axis=1) / valid_count_f
+            log_mel_norm = diff * ops.rsqrt(var + 1e-5)
+
+            # Mean-fill (i.e. zero after subtracting the mean) the padded
+            # tail so it doesn't pollute the encoder's self-attention with
+            # extreme values. ``diff`` is already zero where ``mask == 0``,
+            # so the multiplication by ``rsqrt(var)`` keeps it zero.
+            log_mel = log_mel_norm
 
         graph.output(log_mel)
 
