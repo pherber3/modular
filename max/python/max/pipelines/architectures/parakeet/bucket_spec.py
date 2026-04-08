@@ -27,9 +27,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Audio constants matching ``mel_graph.py``. Duplicated here (instead of
-# imported) to keep this module dependency-free; ``mel_graph.py`` imports
-# from us, not the other way around.
+# Canonical audio constants for the Parakeet pipeline. Kept here (the
+# stdlib-only module) so both ``mel_graph.py`` and ``bucket_spec.py``
+# pull from a single source without creating an import cycle —
+# ``mel_graph.py`` imports these from us, not the other way around.
 SAMPLE_RATE = 16000
 HOP_LENGTH = 160
 N_FFT = 512

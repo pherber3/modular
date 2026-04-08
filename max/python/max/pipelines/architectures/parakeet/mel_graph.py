@@ -24,22 +24,14 @@ from max.dtype import DType
 from max.graph import DeviceRef, Graph, TensorType, ops
 
 from .audio import _mel_filterbank
+from .bucket_spec import HOP_LENGTH, N_FFT, SAMPLE_RATE
 
 # Audio constants matching NeMo's AudioToMelSpectrogramPreprocessor defaults.
-SAMPLE_RATE = 16000
-N_FFT = 512
-HOP_LENGTH = 160
+# SAMPLE_RATE / N_FFT / HOP_LENGTH are imported from bucket_spec (the canonical
+# source — bucket_spec has to duplicate them otherwise since it stays
+# stdlib-only to avoid an import cycle).
 WIN_LENGTH = 400
 LOG_EPSILON = 2**-24
-
-# Maximum mel frames the encoder accepts. Will be replaced by per-bucket
-# values in Step 8 of the bucketing refactor; kept here for callers that
-# still use the legacy fixed-shape mel graph.
-MAX_MEL_FRAMES = 3200
-
-# Maximum audio samples after center-padding, derived from MAX_MEL_FRAMES.
-# Inverse of: n_frames = 1 + (audio_samples - N_FFT) // HOP_LENGTH
-MAX_AUDIO_SAMPLES = (MAX_MEL_FRAMES - 1) * HOP_LENGTH + N_FFT
 
 
 def _build_padded_window(periodic: bool) -> np.ndarray:
